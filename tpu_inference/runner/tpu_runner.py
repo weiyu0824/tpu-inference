@@ -322,6 +322,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sharding_strategy.attn_dp_expert_size,
             sharding_strategy.expert_size,
             sharding_strategy.tp_size,
+            sharding_strategy.pcp_size,
+            sharding_strategy.dcp_size,
         )
 
         # Attempt to create a physically optimized mesh. Fall back to a simple
@@ -351,8 +353,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sharding_strategy.attn_dp_expert_size,
             sharding_strategy.expert_size,
             sharding_strategy.tp_size,
+            sharding_strategy.prefill_context_parallelism,
+            sharding_strategy.decode_context_parallelism,
         )
-        dcn_mesh_shape = (num_slices, 1, 1, 1, 1)
+        dcn_mesh_shape = (num_slices, 1, 1, 1, 1, 1, 1)
 
         # Attempt to create a physically optimized hybrid mesh (ICI + DCN).
         # Fall back to a logical reshape for non-power-of-two device counts
@@ -577,6 +581,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def initialize_kv_cache(self,
                             kv_cache_config: KVCacheConfig,
                             topology_order_id: int = 0) -> None:
+        print("tpu-inference init kv caches")
+        print("kv cache config --> ")
+        print(kv_cache_config)
+       
         self.topology_order_id = topology_order_id
         self.kv_cache_config = kv_cache_config
         self.use_hybrid_kvcache = len(kv_cache_config.kv_cache_groups) > 1
@@ -1675,6 +1683,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
          logits_indices, request_distribution) = device_array(
              self.mesh, (input_ids, positions, query_start_loc, seq_lens,
                          logits_indices, request_distribution))
+        # Shard attention data if CP is enabled 
+        # 1) input_positions, 2) seq_lens, 3) query_start_loc 4) distribution
+        
+
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_tables = self.block_tables_cpu[kv_cache_gid][:self.
@@ -1819,3 +1831,4 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         hasher = hashlib.sha1()
         hasher.update(unique_str.encode('utf-8'))
         return int.from_bytes(hasher.digest()[:8], 'big')
+ 

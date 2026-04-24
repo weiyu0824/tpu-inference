@@ -161,7 +161,7 @@ class CompilationManager:
         dp_size = self.runner.vllm_config.sharding_config.total_dp_size
         dp_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(
-                ShardingAxisName.ATTN_DATA, )) if dp_size > 1 else None
+                ShardingAxisName.DP, )) if dp_size > 1 else None
 
         # Keep existing pattern for complex array operations
         seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
@@ -263,7 +263,9 @@ class CompilationManager:
                 dp_sharding = NamedSharding(
                     self.runner.mesh,
                     PartitionSpec(ShardingAxisName.ATTN_DATA, ))
-                next_tokens_sharding = dp_sharding
+                next_tokens_sharding = NamedSharding(
+                    self.runner.mesh,
+                    PartitionSpec(ShardingAxisName.DP, ))
             else:
                 dp_sharding = None
                 next_tokens_sharding = NamedSharding(self.runner.mesh,
@@ -431,7 +433,7 @@ class CompilationManager:
         else:
             index_paddings = self.runner.num_reqs_paddings
         dp_sharding = NamedSharding(self.runner.mesh,
-                                    PartitionSpec(ShardingAxisName.ATTN_DATA))
+                                    PartitionSpec(ShardingAxisName.DP))
         hidden_states_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
         dp_size = self.runner.vllm_config.sharding_config.total_dp_size
@@ -475,7 +477,7 @@ class CompilationManager:
         hsize = self.runner.model_config.get_hidden_size()
         leading_shape = self.runner.num_reqs_paddings if not self.runner.speculative_config else self.runner.num_logits_paddings
         dp_sharding = NamedSharding(self.runner.mesh,
-                                    PartitionSpec(ShardingAxisName.ATTN_DATA))
+                                    PartitionSpec(ShardingAxisName.DP))
         for num_reqs in leading_shape:
             hidden_states = self._create_dummy_tensor(
                 (num_reqs, hsize), jnp.bfloat16, dp_sharding)

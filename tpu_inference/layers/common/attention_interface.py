@@ -32,6 +32,7 @@ from tpu_inference.kernels.flash_attention.kernel import flash_attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_megacore
+from tpu_inference import utils
 
 MAX_ALLOWED_PAGE_INDICES_N = (
     128 * 1024
@@ -301,11 +302,12 @@ def sharded_ragged_paged_attention(
     v_scale: float | None = None,
 ):
     """Shards along KV heads."""
+    print("Adopt sharded_ragged_paged_attention inside attention interface")
     # Handle GQA/MQA where num_kv_heads < tp_size
     # We replicate KV heads to match tp_size so that we can shard them evenly.
     # TODO (ranlihao): This is not performant and introduces extra overhead during inference. We need to handle this during weight loading
-    if ShardingAxisName.ATTN_HEAD in mesh.shape:
-        tp_size = mesh.shape[ShardingAxisName.ATTN_HEAD]
+    tp_size = utils.get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+    if tp_size > 1:
         num_kv_heads = k.shape[1]
         if num_kv_heads < tp_size:
             if tp_size % num_kv_heads != 0:
@@ -316,20 +318,33 @@ def sharded_ragged_paged_attention(
             k = jnp.repeat(k, factor, axis=1)
             v = jnp.repeat(v, factor, axis=1)
 
-    qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
-    kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None,
-                      ShardingAxisName.ATTN_HEAD, None, None)
+    # qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
+    # Note that Wq, Wk, Wv is sharded by ShardingAxisName.DP so projected q,k,v are all sharded by ShardingAxisName.DP
+    # but we need to all-gather KV before attention so that every partial q can attend to every kv. 
+    # Here we defined q_in_spec and kv_in_spec  
+    q_in_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None) 
+    kv_in_spec = P(ShardingAxisName.DP, ShardingAxisName.ATTN_HEAD, None)
+
+    kv_cache_spec = P(ShardingAxisName.KV_CACHE_BLOCK,
+                          ShardingAxisName.KV_CACHE_PAGE,
+                          ShardingAxisName.KV_CACHE_HEAD)
+
+    # metadata_spec = P() 
+    metadata_spec = P(ShardingAxisName.DP)
     in_specs = (
-        qkv_spec,  # q
-        qkv_spec,  # k
-        qkv_spec,  # v
+        q_in_spec,  # q
+        kv_in_spec,  # k
+        kv_in_spec,  # v
         kv_cache_spec,  # kv cache
-        P(ShardingAxisName.ATTN_DATA),  # kv_lens
-        P(ShardingAxisName.ATTN_DATA),  # page_indices
-        P(ShardingAxisName.ATTN_DATA),  # cu_q_lens
-        P(ShardingAxisName.ATTN_DATA),  # distribution
+        P(ShardingAxisName.DP),  # kv_lens
+        P(ShardingAxisName.DP),  # page_indices
+        P(ShardingAxisName.DP),  # cu_q_lens
+        P(ShardingAxisName.DP),  # distribution
     )
-    out_specs = (qkv_spec, kv_cache_spec)
+    out_specs = (
+        q_in_spec,    # output
+        kv_cache_spec # kv_cache
+    )
 
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
@@ -362,6 +377,8 @@ def sharded_ragged_paged_attention(
         check_vma=False,
     )(*args)
 
+def cp_attention():
+    pass
 
 def attention(
     kv_cache: jax.Array,
@@ -405,7 +422,7 @@ def attention(
         k,
         v,
         kv_cache,
-        md.seq_lens,
+        md.seq_lens, # kv_lens
         md.block_tables,
         md.query_start_loc,
         md.request_distribution,

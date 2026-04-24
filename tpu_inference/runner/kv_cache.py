@@ -44,6 +44,11 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
 
     axis_name = ShardingAxisName.ATTN_HEAD
     model_cnt = utils.get_mesh_shape_product(mesh, axis_name)
+    pcp_size = utils.get_mesh_shape_product(mesh, 'pcp')
+    dcp_size = utils.get_mesh_shape_product(mesh, 'dcp')
+    
+    # Multiply block_size by pcp * dcp
+    # page_size = page_size * pcp_size * dcp_size
 
     assert actual_num_kv_heads % model_cnt == 0
     # NOTE(chengjiyao): Currently, the attention kernel is tailored to the
@@ -111,8 +116,13 @@ def create_kv_caches(
     else:
         sharding = NamedSharding(
             mesh,
-            PartitionSpec(ShardingAxisName.ATTN_DATA, None,
-                          ShardingAxisName.ATTN_HEAD))
+            # Previously: ATTN_HEAD=(model) ATTN_DATA=(data, attn_dp)
+            # num_blocks --> shard by (data, attn_dp)
+            # block_size --> shard by (pcp, dcp)
+            # head       --> shard by  
+            PartitionSpec(ShardingAxisName.KV_CACHE_BLOCK,
+                          ShardingAxisName.KV_CACHE_PAGE,
+                          ShardingAxisName.KV_CACHE_HEAD))
 
     def _allocate() -> jax.Array:
         return jnp.empty(

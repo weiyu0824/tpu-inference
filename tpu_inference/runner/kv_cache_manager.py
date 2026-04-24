@@ -59,12 +59,13 @@ class KVCacheManager:
     def _create_attention_spec(
             self,
             block_size: int,
+            logical_block_size: int,
             num_kv_heads: int,
             head_size: int,
             sliding_window: bool | None = None) -> KVCacheSpec:
         if self.use_mla:
             page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.mesh, logical_block_size, num_kv_heads, head_size,
                 self.runner.kv_cache_dtype, True)
             return MLAAttentionSpec(block_size=block_size,
                                     num_kv_heads=1,
@@ -75,7 +76,7 @@ class KVCacheManager:
                                     page_size_padded=page_size_bytes)
         else:
             page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.mesh, logical_block_size, num_kv_heads, head_size,
                 self.runner.kv_cache_dtype, False)
             if sliding_window is not None:
                 return SlidingWindowSpec(block_size=block_size,
@@ -94,6 +95,11 @@ class KVCacheManager:
     def get_kv_cache_spec(self):
         # TODO(xiang): this hack tricks engine core to init successfully
         block_size = self.runner.cache_config.block_size
+        logical_block_size = (
+            block_size *
+            self.runner.vllm_config.parallel_config.decode_context_parallel_size *
+            self.runner.vllm_config.parallel_config.prefill_context_parallel_size
+        )
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
         tp_axis_name = ShardingAxisName.ATTN_HEAD
@@ -125,11 +131,9 @@ class KVCacheManager:
 
             for i in range(model_config.get_num_layers(parallel_config)):
                 if self.use_mla:
-                    kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(
-                        block_size, 1, mla_head_size)
+                    kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(block_size, logical_block_size, 1, mla_head_size)
                 else:
-                    kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(
-                        block_size, num_kv_heads, head_size)
+                    kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(block_size, logical_block_size, num_kv_heads, head_size)
 
             if self.runner.speculative_config and self.runner.speculative_config.method == "eagle3":
                 draft_model_config = self.runner.speculative_config.draft_model_config
@@ -143,11 +147,13 @@ class KVCacheManager:
                     if self.use_mla:
                         kv_cache_spec[
                             f"draft_layer.{i}"] = self._create_attention_spec(
-                                block_size, 1, mla_head_size)
+                                block_size,
+                                logical_block_size, 1, mla_head_size)
                     else:
                         kv_cache_spec[
                             f"draft_layer.{i}"] = self._create_attention_spec(
-                                block_size, num_kv_heads, head_size)
+                                block_size,
+                                logical_block_size, num_kv_heads, head_size)
         else:
             # Else propagate attention modules from compilation config.
             layers = get_layers_from_vllm_config(self.runner.vllm_config,
@@ -176,17 +182,20 @@ class KVCacheManager:
                         kv_cache_spec[
                             layer_name] = self._create_attention_spec(
                                 block_size,
+                                logical_block_size,
                                 num_kv_heads,
                                 head_size,
                                 sliding_window=attn_module.sliding_window)
                     elif self.use_mla:
                         kv_cache_spec[
                             layer_name] = self._create_attention_spec(
-                                block_size, 1, mla_head_size)
+                                block_size,
+                                logical_block_size, 1, mla_head_size)
                     else:
                         kv_cache_spec[
                             layer_name] = self._create_attention_spec(
-                                block_size, num_kv_heads, head_size)
+                                block_size,
+                                logical_block_size, num_kv_heads, head_size)
                 elif attn_module.attn_type in (AttentionType.ENCODER,
                                                AttentionType.ENCODER_ONLY):
                     # encoder-only attention does not need KV cache.
@@ -232,6 +241,9 @@ class KVCacheManager:
         # There will be no KV cache for pooling models.
         if not kv_cache_config.kv_cache_groups:
             return
+        print(f'Current model have {len(kv_cache_config.kv_cache_groups)} type of KV cache spec')
+        for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups): 
+            print(f"group {i}, {kv_cache_group.__class__.__name__}") 
         # uniform page size.
         representative_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
         page_size_bytes = representative_spec.page_size_bytes
@@ -240,15 +252,25 @@ class KVCacheManager:
         for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
             assert kv_cache_tensor.size % page_size_bytes == 0
             num_blocks = kv_cache_tensor.size // page_size_bytes
-            dp_size = self.runner.vllm_config.sharding_config.total_dp_size
-            # num_blocks must be a multiple of dp_size
-            num_blocks = (num_blocks // dp_size) * dp_size
+            sharding_strategy = self.runner.vllm_config.sharding_config
+            # num_blocks must be a multiple of the product of axes it's sharded over.
+            # In new model design, the block dimension is sharded across the data,
+            # attn_dp and model axes.
+            sharding_divisor = (sharding_strategy.model_dp_size *
+                                sharding_strategy.attn_dp_size *
+                                sharding_strategy.tp_size)
+            num_blocks = (num_blocks // sharding_divisor) * sharding_divisor
             # NOTE: we'll multiply the num_kv_heads by 2 in the function
             if self.use_mla:
                 head_size = self.runner.model_config.hf_config.kv_lora_rank + \
                     self.runner.model_config.hf_config.qk_rope_head_dim
             else:
                 head_size = representative_spec.head_size
+                
+            print('tpu-inference kv manager init kv')
+            print(f"Tensor({i}) n_block={num_blocks}, kv_size={kv_cache_tensor.size}, psize={page_size_bytes}, logical_bsize={representative_spec.block_size}")
+            print(f"Tensor({i}) is shared by: {kv_cache_tensor.shared_by}")
+
             kv_cache = create_kv_caches(
                 num_blocks=num_blocks,
                 block_size=representative_spec.block_size,
@@ -270,6 +292,7 @@ class KVCacheManager:
                 self.runner.layer_name_to_kvcache_index[
                     layer_name] = self.runner.layer_name_to_kvcache_index[
                         target_layer_name]
+                print(f"kv cache sharing: {layer_name}-->{target_layer_name}")
 
         logger.info(
             f"Init kv-cache | "
@@ -484,7 +507,9 @@ class KVCacheManager:
             f"Transferring kv cache shape {len(kv_cache_slices)} * {kv_cache_slices[0].shape} sharding {kv_cache_slices[0].sharding} size {kv_cache_slices[0].nbytes * len(kv_cache_slices)/1024/1024} Mbytes"
         )
         sharding = NamedSharding(
-            self.runner.mesh, PartitionSpec(None, ShardingAxisName.ATTN_HEAD))
+            self.runner.mesh,
+            PartitionSpec(ShardingAxisName.KV_CACHE_PAGE,
+                          ShardingAxisName.ATTN_HEAD, None))
         if envs.VLLM_TPU_USING_PATHWAYS:
             from pathwaysutils.experimental import \
                 reshard as experimental_reshard

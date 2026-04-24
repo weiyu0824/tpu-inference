@@ -160,6 +160,7 @@ class TpuPlatform(Platform):
         # For v0, the default block size is 16.
         if cache_config and cache_config.block_size is None:
             cache_config.block_size = cast(BlockSize, 16)
+            print("cache config bsz", cache_config.block_size)
             if vllm_config.model_config:
                 from tpu_inference.layers.vllm.attention import \
                     PallasAttentionBackend
