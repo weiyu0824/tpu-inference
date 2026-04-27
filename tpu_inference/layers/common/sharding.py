@@ -42,11 +42,11 @@ class ShardingAxisNameBase:
     MLP_DATA = 'data'
     ATTN_HEAD = ('model', 'expert', 'dcp')
     ATTN_TENSOR = None
-    MLP_TENSOR = ('attn_dp', 'attn_dp_expert', 'model', 'dcp', 'expert')
+    MLP_TENSOR = ('attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
     MOE_TENSOR = ('attn_dp', 'model', 'dcp')
     EXPERT = ('attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
     EXPERT_DATA = ('data', 'attn_dp', 'attn_dp_expert', 'expert', 'model')
-    VOCAB = ('data', 'expert', 'attn_dp', 'model', 'dcp')
+    VOCAB = ('data',  'attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
     MODEL_1 = 'model'
     MODEL_2 = 'expert'
 
@@ -167,8 +167,6 @@ class ShardingConfigManager:
         sequence_parallelism = sharding_strategy.get("sequence_parallelism", 1)
         device_indexes = sharding_strategy.get("device_indexes", None)
 
-        # Decode Context Parallel is introduced in vllm.
-        # https://github.com/vllm-project/vllm/blob/bb51d5b40db6076fc477df27a57e70b7421d87c1/vllm/config/parallel.py
         decode_context_parallelism = parallel_config.decode_context_parallel_size
 
         enable_dp_attention = sharding_strategy.get("enable_dp_attention",

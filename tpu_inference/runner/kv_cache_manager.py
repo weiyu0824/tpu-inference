@@ -847,7 +847,6 @@ class KVCacheManager:
                 self.runner.layer_name_to_kvcache_index[
                     layer_name] = self.runner.layer_name_to_kvcache_index[
                         target_layer_name]
-                print(f"kv cache sharing: {layer_name}-->{target_layer_name}")
 
         logger.info(
             "Hybrid KV cache layout: num_kv_cache_groups=%d, "
@@ -1097,9 +1096,7 @@ class KVCacheManager:
             f"Transferring kv cache shape {len(kv_cache_slices)} * {kv_cache_slices[0].shape} sharding {kv_cache_slices[0].sharding} size {kv_cache_slices[0].nbytes * len(kv_cache_slices)/1024/1024} Mbytes"
         )
         sharding = NamedSharding(
-            self.runner.mesh,
-            PartitionSpec(ShardingAxisName.KV_CACHE_PAGE,
-                          ShardingAxisName.ATTN_HEAD, None))
+            self.runner.mesh, PartitionSpec(None, ShardingAxisName.ATTN_HEAD))
         if envs.VLLM_TPU_USING_PATHWAYS:
             from pathwaysutils.experimental import \
                 reshard as experimental_reshard
