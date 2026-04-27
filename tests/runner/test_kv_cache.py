@@ -96,7 +96,7 @@ def test_create_kv_caches_mla(mesh: Mesh):
 
     # For MLA, sharding is by the 'model' axis on the token dimension.
     expected_sharding = NamedSharding(
-        mesh, PartitionSpec(ShardingAxisName.MLP_TENSOR))
+        mesh, PartitionSpec(ShardingAxisName.BATCH, ShardingAxisName.CONTEXT))
     expected_dtype = jnp.bfloat16
     expected_shape = get_kv_cache_shape_with_mesh(
         mesh,

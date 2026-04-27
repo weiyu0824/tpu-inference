@@ -79,7 +79,6 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
                                   actual_num_kv_heads // model_cnt,
                                   actual_head_dim, kv_dtype))
         shape[2] *= model_cnt
-    print('shape', shape)
     return tuple(shape)
 
 
@@ -126,7 +125,8 @@ def create_kv_caches(
     if use_mla:
         sharding = NamedSharding(
             mesh,
-            PartitionSpec(ShardingAxisName.MLP_TENSOR))
+            PartitionSpec(ShardingAxisName.BATCH,
+                          ShardingAxisName.CONTEXT))
     else:
         sharding = NamedSharding(
             mesh,
