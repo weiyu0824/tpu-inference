@@ -84,13 +84,12 @@ class KVCacheManager:
     def _create_attention_spec(
             self,
             block_size: int,
-            logical_block_size: int,
             num_kv_heads: int,
             head_size: int,
             sliding_window: bool | None = None) -> KVCacheSpec:
         if self.use_mla:
             page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, logical_block_size, num_kv_heads, head_size,
+                self.runner.mesh, block_size, num_kv_heads, head_size,
                 self.runner.kv_cache_dtype, True)
             page_size_padded = (self._hybrid_uniform_page_size_bytes
                                 if self._hybrid_uniform_page_size_bytes
@@ -104,7 +103,7 @@ class KVCacheManager:
                                     page_size_padded=page_size_padded)
         else:
             page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, logical_block_size, num_kv_heads, head_size,
+                self.runner.mesh, block_size, num_kv_heads, head_size,
                 self.runner.kv_cache_dtype, False)
             page_size_padded = (self._hybrid_uniform_page_size_bytes
                                 if self._hybrid_uniform_page_size_bytes
@@ -424,8 +423,7 @@ class KVCacheManager:
     def get_kv_cache_spec(self):
         # TODO(xiang): this hack tricks engine core to init successfully
         block_size = self.runner.cache_config.block_size
-        logical_block_size = (
-            block_size *
+        block_size *= (
             self.runner.vllm_config.parallel_config.decode_context_parallel_size *
             self.runner.vllm_config.parallel_config.prefill_context_parallel_size
         )
@@ -459,7 +457,7 @@ class KVCacheManager:
             for i in range(model_config.get_num_layers(parallel_config)):
                 if self.use_mla:
                     kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(
-                        block_size, logical_block_size, 1, mla_head_size)
+                        block_size, 1, mla_head_size)
                 else:
                     # TODO(kwang3939): unify the hybrid kv cache of jax path and tochax path.
                     layer_type = "full_attention"
@@ -504,13 +502,11 @@ class KVCacheManager:
                     if self.use_mla:
                         kv_cache_spec[
                             f"draft_layer.{i}"] = self._create_attention_spec(
-                                block_size,
-                                logical_block_size, 1, mla_head_size)
+                                block_size, 1, mla_head_size)
                     else:
                         kv_cache_spec[
                             f"draft_layer.{i}"] = self._create_attention_spec(
-                                block_size,
-                                logical_block_size, num_kv_heads, head_size)
+                                block_size, num_kv_heads, head_size)
         else:
             # Else propagate attention modules from compilation config.
             layers = get_layers_from_vllm_config(
@@ -581,20 +577,17 @@ class KVCacheManager:
                         kv_cache_spec[
                             layer_name] = self._create_attention_spec(
                                 block_size,
-                                logical_block_size,
                                 num_kv_heads,
                                 head_size,
                                 sliding_window=attn_module.sliding_window)
                     elif self.use_mla:
                         kv_cache_spec[
                             layer_name] = self._create_attention_spec(
-                                block_size,
-                                logical_block_size, 1, mla_head_size)
+                                block_size, 1, mla_head_size)
                     else:
                         kv_cache_spec[
                             layer_name] = self._create_attention_spec(
-                                block_size,
-                                logical_block_size, num_kv_heads, head_size)
+                                block_size, num_kv_heads, head_size)
                 elif attn_module.attn_type in (AttentionType.ENCODER,
                                                AttentionType.ENCODER_ONLY):
                     # encoder-only attention does not need KV cache.
