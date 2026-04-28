@@ -46,7 +46,7 @@ class ShardingAxisNameBase:
     MOE_TENSOR = ('attn_dp', 'model', 'dcp')
     EXPERT = ('attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
     EXPERT_DATA = ('data', 'attn_dp', 'attn_dp_expert', 'expert', 'model')
-    VOCAB = ('data',  'attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
+    VOCAB = ('attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
     MODEL_1 = 'model'
     MODEL_2 = 'expert'
 
