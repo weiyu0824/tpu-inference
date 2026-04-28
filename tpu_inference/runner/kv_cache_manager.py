@@ -641,16 +641,9 @@ class KVCacheManager:
                 assert kv_cache_tensor.size % page_size_bytes == 0
                 num_blocks = kv_cache_tensor.size // page_size_bytes
 
-            if self.use_mla and not self.runner.vllm_config.additional_config.get(
-                    "sharding", {}).get("sharding_strategy", {}).get(
-                        "enable_dp_attention", False):
-                # MLA KV cache is sharded over MLP_TENSOR
-                divisor = common_utils.get_mesh_shape_product(
-                    self.runner.mesh, ShardingAxisName.MLP_TENSOR)
-            else:
-                # Default KV cache is sharded over ATTN_DATA
-                divisor = common_utils.get_mesh_shape_product(
-                    self.runner.mesh, ShardingAxisName.ATTN_DATA)
+            # Default KV cache is sharded over (BATCH=(dp, attn_dp))
+            divisor = common_utils.get_mesh_shape_product(
+                self.runner.mesh, ShardingAxisName.BATCH)
 
             # num_blocks must be a multiple of the sharding divisor
             num_blocks = (num_blocks // divisor) * divisor
