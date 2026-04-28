@@ -346,10 +346,7 @@ class KVCacheManager:
     def get_kv_cache_spec(self):
         # TODO(xiang): this hack tricks engine core to init successfully
         block_size = self.runner.cache_config.block_size
-        block_size *= (
-            self.runner.vllm_config.parallel_config.decode_context_parallel_size *
-            self.runner.vllm_config.parallel_config.prefill_context_parallel_size
-        )
+        block_size *= self.runner.vllm_config.parallel_config.decode_context_parallel_size
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
         tp_axis_name = ShardingAxisName.ATTN_HEAD
