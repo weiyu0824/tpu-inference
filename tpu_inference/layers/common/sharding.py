@@ -26,7 +26,8 @@ from tpu_inference import envs, utils
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-MESH_AXIS_NAMES = ("data", "attn_dp", "attn_dp_expert", "expert", "model", "dcp")
+MESH_AXIS_NAMES = ("data", "attn_dp", "attn_dp_expert", "expert", "model",
+                   "dcp")
 MESH_AXIS_NAMES_2D = ('data', 'model')
 
 
@@ -45,7 +46,8 @@ class ShardingAxisNameBase:
     MLP_TENSOR = ('attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
     MOE_TENSOR = ('attn_dp', 'model', 'dcp')
     EXPERT = ('attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
-    EXPERT_DATA = ('data', 'attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
+    EXPERT_DATA = ('data', 'attn_dp', 'attn_dp_expert', 'expert', 'model',
+                   'dcp')
     VOCAB = ('attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
     MODEL_1 = 'model'
     MODEL_2 = 'expert'
@@ -54,6 +56,7 @@ class ShardingAxisNameBase:
     BATCH = ('data', 'attn_dp')
     CONTEXT = 'dcp'
     KV_CACHE_HEAD = ('model', 'expert')
+
 
 class ShardingAxisName2D:
     """Sharding axis names for 2D data parallelism scenarios.
@@ -74,6 +77,7 @@ class ShardingAxisName2D:
     BATCH = 'data'
     CONTEXT = None
     KV_CACHE_HEAD = 'model'
+
 
 # Lazily initialize the ShardingAxisName so that we can decide which one to use based on the
 # propagated / updated environment variables in the multi-host setup.
@@ -268,12 +272,11 @@ class ShardingConfigManager:
                 raise ValueError(
                     "Must run Attention DP with NEW_MODEL_DESIGN enabled. Please set "
                     "NEW_MODEL_DESIGN=True")
-        if sharding_strategy.decode_context_parallelism > 1 :
+        if sharding_strategy.decode_context_parallelism > 1:
             if not envs.NEW_MODEL_DESIGN:
                 raise ValueError(
                     "Must run Context Parallelism with NEW_MODEL_DESIGN enabled. Please set "
-                    "NEW_MODEL_DESIGN=True"
-                )
+                    "NEW_MODEL_DESIGN=True")
 
     @property
     def total_dp_size(self) -> int:
