@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     MODEL_IMPL_TYPE: str = "auto"
     DRAFT_MODEL_IMPL_TYPE: str = "auto"
+    USE_2D_TP: bool = False
+    ENABLE_CONTEXT_PARALLEL: bool = False
     NEW_MODEL_DESIGN: bool = False
     PHASED_PROFILING_DIR: str = ""
     PYTHON_TRACER_LEVEL: int = 1
@@ -190,6 +192,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable 2D tensor parallelism, shard attention heads across multiple axes
     "USE_2D_TP":
     env_bool("USE_2D_TP", default=False),
+    # Enable context parallelism (DCP)
+    "ENABLE_CONTEXT_PARALLEL":
+    env_bool("ENABLE_CONTEXT_PARALLEL", default=False),
     # Enable new experimental model design
     "NEW_MODEL_DESIGN":
     env_bool("NEW_MODEL_DESIGN", default=False),
