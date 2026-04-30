@@ -1576,9 +1576,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         metadata_blob, metadata_layout = self.device_buffer.build()
 
-        (request_distribution, dev_arrays_payload) = device_array(
-            self.mesh, (request_distribution, metadata_blob),
-            sharding=data_parallel_attn_sharding)
+        # Mamba slot ids are only consumed by hybrid attn+mamba models; for
+        # pure-attention models, leaving the field None keeps AttentionMetadata
+        # byte-identical to the pre-compact-mamba layout (so the model_fn
+        # signature on those models is unchanged).
+        if self.kv_cache_config.has_mamba_layers:
+            # Per-request mamba state slot ids; copy to keep the InputBatch's
+            # CPU buffer free for the next step's bookkeeping.
+            mamba_state_indices_cpu = self.input_batch.mamba_state_indices_cpu.copy(
+            )
+            (request_distribution, mamba_state_indices,
+             dev_arrays_payload) = device_array(
+                 self.mesh, (request_distribution, mamba_state_indices_cpu,
+                             metadata_blob),
+                 sharding=data_parallel_attn_sharding)
+        else:
+            mamba_state_indices = None
+            (request_distribution, dev_arrays_payload) = device_array(
+                self.mesh, (request_distribution, metadata_blob),
+                sharding=data_parallel_attn_sharding)
 
         metadata = common_utils.DeviceBuffer.unpack_arrays(
             dev_arrays_payload, metadata_layout)
@@ -1594,6 +1610,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
+                mamba_state_indices=mamba_state_indices,
             )
 
             # This is for making these cpu buffers hidden during tracing
@@ -1847,9 +1864,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         metadata_blob, metadata_layout = self.device_buffer.build()
 
-        (request_distribution, dev_arrays_payload) = device_array(
-            self.mesh, (request_distribution, metadata_blob),
-            sharding=data_parallel_attn_sharding)
+        # Mamba slot ids are only consumed by hybrid attn+mamba models; for
+        # pure-attention models, leaving the field None keeps AttentionMetadata
+        # byte-identical to the pre-compact-mamba layout (so the model_fn
+        # signature on those models is unchanged).
+        if self.kv_cache_config.has_mamba_layers:
+            # Per-request mamba state slot ids; copy to keep the InputBatch's
+            # CPU buffer free for the next step's bookkeeping.
+            mamba_state_indices_cpu = self.input_batch.mamba_state_indices_cpu.copy(
+            )
+            (request_distribution, mamba_state_indices,
+             dev_arrays_payload) = device_array(
+                 self.mesh, (request_distribution, mamba_state_indices_cpu,
+                             metadata_blob),
+                 sharding=data_parallel_attn_sharding)
+        else:
+            mamba_state_indices = None
+            (request_distribution, dev_arrays_payload) = device_array(
+                self.mesh, (request_distribution, metadata_blob),
+                sharding=data_parallel_attn_sharding)
 
         metadata = common_utils.DeviceBuffer.unpack_arrays(
             dev_arrays_payload, metadata_layout)
@@ -1864,7 +1897,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 block_tables=block_tables,
                 seq_lens=seq_lens,
                 query_start_loc=query_start_loc,
-                request_distribution=request_distribution)
+                request_distribution=request_distribution,
+                mamba_state_indices=mamba_state_indices,
+            )
             # This is for making these cpu buffers hidden during tracing
             attention_metadata_gid.query_start_loc_cpu = query_start_loc_view
             attention_metadata_gid.seq_lens_cpu = seq_lens_view
