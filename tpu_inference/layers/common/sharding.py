@@ -53,7 +53,7 @@ class ShardingAxisNameBase:
     MODEL_2 = 'expert'
 
     # These axes are used in KV caches management.
-    BATCH = ('data', 'attn_dp')
+    BATCH = ('data', 'attn_dp', 'attn_dp_expert')
     CONTEXT = 'dcp'
     KV_CACHE_HEAD = ('model', 'expert')
 
