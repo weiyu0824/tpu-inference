@@ -309,6 +309,7 @@ def _ragged_paged_attention_kernel_loop(
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
     kv_cache_lens_ref, # [max_num_seqs]
+    cp_rank_ref,  # [1] - passed as scalar prefetch so traced values (e.g. axis_index) work
     # Input
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
@@ -327,7 +328,6 @@ def _ragged_paged_attention_kernel_loop(
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
     kv_shuffle_vmem_ref,  # [page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim],
     *,
-    cp_rank: int | None = None,
     cp_group_size: int | None = None,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
@@ -349,6 +349,10 @@ def _ragged_paged_attention_kernel_loop(
 ):
   assert q_hbm_ref.shape == o_hbm_ref.shape
   assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
+
+  # Load cp_rank from its SMEM ref so it's a properly traced kernel value,
+  # supporting future use of jax.lax.axis_index('dcp') as the rank source.
+  cp_rank = cp_rank_ref[0]
 
   if case == RpaCase.DECODE:
     use_causal_mask = False
@@ -625,9 +629,6 @@ def _ragged_paged_attention_kernel_loop(
   def _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, *, wait=False):
     _cp_rank = cp_rank if cp_rank is not None else 0
     _cp_group_size = cp_group_size if cp_group_size is not None else 1
-    __cp_rank = cp_rank if cp_rank is not None else 0
-    _cp_group_size = cp_group_size if cp_group_size is not None else 1
-    __cp_group_size = cp_group_size if cp_group_size is not None else 1
     sem = sems.at[3, bkv_sem_idx]
 
     local_offset_start = (offset + _cp_group_size - 1 - _cp_rank) // _cp_group_size
@@ -663,6 +664,7 @@ def _ragged_paged_attention_kernel_loop(
           :num_kv_heads_x2_per_kv_packing,
       ]
 
+      # Loop every page
       def loop_body(i, states):
         remaining_sz, ignore = states
         sz = jnp.minimum(page_size - ignore, remaining_sz)
@@ -686,8 +688,13 @@ def _ragged_paged_attention_kernel_loop(
           unroll=False,
       )
     else:
-      dst = cache_hbm_ref.at[0, 0]
+      # @pl.when(update_sz > 0)
+      # def _():
+      #   dst = cache_hbm_ref.at[pl.ds(0, update_sz)]
+      #   _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+      dst = cache_hbm_ref.at[pl.ds(0, update_sz)]
       _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+
 
   def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
     sem = sems.at[1, bq_sem_idx]
@@ -1533,6 +1540,7 @@ def get_default_block_sizes(
 
   max_q = next_power_of_2(max_num_tokens)
   max_kv = pages_per_seq * page_size
+  max_bkv_sz = 4096 # Add this to avoid vmem oom
 
   match tpu_version:
     case 5 | 6:
@@ -1593,6 +1601,7 @@ def get_default_block_sizes(
             ),
         )
     case 7:
+      max_bkv_sz = min(max_kv, 4096)
       if case == RpaCase.DECODE:
         bq_sz = 1
         bkv_sz = max(
@@ -1603,7 +1612,7 @@ def get_default_block_sizes(
                 * kv_packing
                 // head_dim_align_factor
                 // num_kv_heads_x2,
-                max_kv,
+                max_bkv_sz,
             ),
         )
         bq_csz = 1
@@ -1615,7 +1624,7 @@ def get_default_block_sizes(
                 * kv_packing
                 // head_dim_align_factor
                 // num_kv_heads_x2,
-                max_kv,
+                max_bkv_sz,
             ),
         )
       else:
@@ -1631,7 +1640,7 @@ def get_default_block_sizes(
                 * kv_packing
                 // head_dim_align_factor
                 // num_kv_heads_x2,
-                max_kv // 2,
+                max_bkv_sz // 2,
             ),
         )
         bq_csz = min(
@@ -1646,7 +1655,7 @@ def get_default_block_sizes(
                 * kv_packing
                 // head_dim_align_factor
                 // num_kv_heads_x2,
-                max_kv // 8,
+                max_bkv_sz // 8,
             ),
         )
     case _:
@@ -1686,6 +1695,7 @@ def get_default_block_sizes(
         "cp_group_size",
     ),
     # donate_argnames=("queries", "keys", "values", "kv_cache"),
+    donate_argnames = ("kv_cache")
 )
 def ragged_paged_attention(
     queries: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
@@ -1696,9 +1706,9 @@ def ragged_paged_attention(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
-    kv_cache_lens: jax.Array ,
+    kv_cache_lens: jax.Array,
     *,
-    cp_rank: int | None = None,
+    cp_rank: jax.Array,  # i32[1] - per-device rank, sharded along the DCP axis
     cp_group_size: int | None = None,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
@@ -1825,6 +1835,7 @@ def ragged_paged_attention(
       head_dim,
   ) = q.shape
   page_size = kv_cache.shape[1]
+  print(f"RPA internal page size={page_size}")
   num_kv_heads_x2_per_kv_packing = kv_cache.shape[2]
   max_num_seqs = kv_lens.shape[0]
   num_page_indices = page_indices.shape[0]
@@ -1890,7 +1901,6 @@ def ragged_paged_attention(
         (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
         out_dtype,
     )
-    __cp_group_size = cp_group_size if cp_group_size is not None else 1
 
     kv_shuffle_scratch = pltpu.VMEM(
         (bkv_sz // (cp_group_size if cp_group_size is not None else 1), num_kv_heads_x2_per_kv_packing, *kv_cache.shape[3:]),
@@ -1910,6 +1920,11 @@ def ragged_paged_attention(
         kv_shuffle_scratch,
     ]
 
+    # cp_rank is a (1,) int32 sharded array (one element per DCP device).
+    # Pass it as a scalar_prefetch so pallas receives it as a proper SMEM ref
+    # rather than a captured closure constant (which pallas rejects).
+    cp_rank_arr = cp_rank
+
     scalar_prefetches = (
         kv_lens,
         # TODO(jevinjiang): can we use ragged page_indices to save some smem?
@@ -1919,14 +1934,9 @@ def ragged_paged_attention(
         init_sem_ids,
         init_bo_ids,
         init_bkv_update_ids,
-        kv_cache_lens
+        kv_cache_lens,
+        cp_rank_arr,
     )
-
-    # Note(weiyulin): Scaler prefetches contain some None values, we have to
-    # calculate the number of active prefetches to set the input_output_aliases
-    # correctly. Previous hardcoded input_output_aliases is not general enough.
-
-    # num_active_prefetches = len([p for p in scalar_prefetches if p is not None])
 
     scope_name = f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
     if sliding_window is not None:
@@ -1934,7 +1944,6 @@ def ragged_paged_attention(
     kernel = pl.pallas_call(
         functools.partial(
             _ragged_paged_attention_kernel,
-            cp_rank=cp_rank,
             cp_group_size=cp_group_size,
             use_causal_mask=use_causal_mask,
             skip_kv_mask=skip_kv_mask,
@@ -1997,7 +2006,7 @@ def ragged_paged_attention(
 
   def _prepare_block_sizes(block_sizes, case):
     if block_sizes is None:
-      return get_default_block_sizes(
+      block_size = get_default_block_sizes(
           q.dtype,
           kv_cache.dtype,
           actual_num_q_heads,
@@ -2009,6 +2018,8 @@ def ragged_paged_attention(
           pages_per_seq,
           case=case,
       )
+      print('block size', block_size)
+      return block_size 
     return {
         "bq_sz": block_sizes[0],
         "bkv_sz": block_sizes[1],
