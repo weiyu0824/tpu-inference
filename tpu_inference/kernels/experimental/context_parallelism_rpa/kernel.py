@@ -70,6 +70,7 @@ def ref_ragged_paged_attention(
     cp_group_size: int | None = None,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
+    skip_cache_attn: bool = False,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -188,6 +189,14 @@ def ref_ragged_paged_attention(
       if sliding_window is not None:
         mask = jnp.logical_and(mask, q_span < kv_span + sliding_window)
       attn = jnp.where(mask, attn, mask_value)
+    if skip_cache_attn:
+      if kv_cache_lens is not None:
+        kv_new_len_i = int(kv_len) - int(kv_cache_lens[i])
+      else:
+        kv_new_len_i = int(q_len)
+      kv_new_start_i = int(kv_len) - kv_new_len_i
+      sa_kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
+      attn = jnp.where(sa_kv_span >= kv_new_start_i, attn, mask_value)
     attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
 
     out = jnp.einsum("hqk,khd->qhd", attn, v).astype(out_dtype)
@@ -332,6 +341,7 @@ def _ragged_paged_attention_kernel_loop(
     cp_group_size: int | None = None,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
+    skip_cache_attn: bool = False,
     sm_scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -420,6 +430,22 @@ def _ragged_paged_attention_kernel_loop(
         jnp.maximum(next_kv_q_gap - sliding_window, 0) // bkv_sz
     )
 
+  if skip_cache_attn:
+    kv_new_start = kv_len - kv_new_len
+    cur_seq_start_bkv_idx = jnp.maximum(cur_seq_start_bkv_idx, kv_new_start // bkv_sz)
+    next_seq_idx_sa = jnp.minimum(seq_idx + 1, end_seq_idx - 1)
+    next_kv_len_sa = kv_lens_ref[next_seq_idx_sa]
+    if kv_cache_lens_ref is not None:
+      next_kv_new_len_sa = next_kv_len_sa - kv_cache_lens_ref[next_seq_idx_sa]
+    else:
+      next_kv_new_len_sa = (
+          cu_q_lens_ref[next_seq_idx_sa + 1] - cu_q_lens_ref[next_seq_idx_sa]
+      )
+    next_seq_start_bkv_idx = jnp.maximum(
+        next_seq_start_bkv_idx,
+        (next_kv_len_sa - next_kv_new_len_sa) // bkv_sz,
+    )
+
   def debug_print(msg, *args):
     if debug_mode:
       pl.debug_print(msg, *args)
@@ -506,6 +532,11 @@ def _ragged_paged_attention_kernel_loop(
 
     if sliding_window is not None:
       mask = mask_and(mask, q_span < k_span + sliding_window)
+
+    if skip_cache_attn:
+      kv_new_start_int = (kv_len - kv_new_len).astype(int_ty)
+      mask = mask_and(mask, k_span >= kv_new_start_int)
+      v = jnp.where(v_span >= kv_new_start_int, v, 0.0)
 
     if mask is not None:
       s = jnp.where(mask, s, mask_value)
@@ -915,6 +946,10 @@ def _ragged_paged_attention_kernel_loop(
             )
             // bkv_sz
         )
+      if skip_cache_attn:
+        next_bq_start_bkv_idx = jnp.maximum(
+            next_bq_start_bkv_idx, (kv_len - kv_new_len) // bkv_sz
+        )
       next_bkv_idx = lax.select(
           is_last_bkv, next_bq_start_bkv_idx, next_bkv_idx
       )
@@ -941,6 +976,10 @@ def _ragged_paged_attention_kernel_loop(
         # Recalculate the start_bkv_idx based on the processed_q_len.
         start_bkv_idx = (
             jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
+        )
+      if skip_cache_attn:
+        start_bkv_idx = jnp.maximum(
+            start_bkv_idx, (kv_len - kv_new_len) // bkv_sz
         )
       if use_causal_mask:
         effective_kv_len = jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
@@ -1236,6 +1275,7 @@ def dynamic_validate_inputs(
     cp_group_size: int | None = None,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
+    skip_cache_attn: bool = False,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -1335,6 +1375,7 @@ def static_validate_inputs(
     cp_group_size: int | None = None,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
+    skip_cache_attn: bool = False,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -1675,6 +1716,7 @@ def get_default_block_sizes(
     static_argnames=(
         "use_causal_mask",
         "skip_kv_mask",
+        "skip_cache_attn",
         "sm_scale",
         "sliding_window",
         "soft_cap",
@@ -1713,6 +1755,7 @@ def ragged_paged_attention(
     cp_group_size: int | None = None,
     use_causal_mask: bool = True,
     skip_kv_mask: bool = False,
+    skip_cache_attn: bool = False,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -1860,6 +1903,7 @@ def ragged_paged_attention(
       bq_csz,
       bkv_csz,
       kv_write_back,
+      skip_cache_attn=False,
       static_q_len=None,
       cp_rank=None,
       cp_group_size=None,
@@ -1948,6 +1992,7 @@ def ragged_paged_attention(
             cp_group_size=cp_group_size,
             use_causal_mask=use_causal_mask,
             skip_kv_mask=skip_kv_mask,
+            skip_cache_attn=skip_cache_attn,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
             soft_cap=soft_cap,
@@ -2034,6 +2079,7 @@ def ragged_paged_attention(
       kv_cache,
       **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
       kv_write_back=kv_write_back,
+      skip_cache_attn=skip_cache_attn,
       static_q_len=1,
       cp_rank=cp_rank,
       cp_group_size=cp_group_size,
@@ -2046,6 +2092,7 @@ def ragged_paged_attention(
         kv_cache,
         **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
         kv_write_back=kv_write_back,
+        skip_cache_attn=skip_cache_attn,
         static_q_len=chunk_prefill_size,
         cp_rank=cp_rank,
         cp_group_size=cp_group_size,
@@ -2057,6 +2104,7 @@ def ragged_paged_attention(
       kv_cache,
       **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
       kv_write_back=kv_write_back,
+      skip_cache_attn=skip_cache_attn,
       static_q_len=None,
       cp_rank=cp_rank,
       cp_group_size=cp_group_size,
