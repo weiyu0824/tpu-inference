@@ -199,6 +199,7 @@ def ref_ragged_paged_attention(
   result = jnp.concatenate(outputs, axis=0)
   return result, kv_cache
 
+
 def get_smem_estimate_bytes(
     max_num_seqs, pages_per_seq, has_kv_cache_lens
 ):
