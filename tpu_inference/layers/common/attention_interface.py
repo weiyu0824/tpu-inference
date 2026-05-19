@@ -507,6 +507,7 @@ def sharded_ragged_paged_attention_experimental(
             cp_rank=cp_rank,
             cp_group_size=cp_group_size,
             kv_write_back=kv_write_back,
+            skip_cache_attn=skip_cache_attn,
         )
         return rpa_experimental.ragged_paged_attention(
             *kernel_args,
@@ -673,6 +674,7 @@ def forward_with_dcp(
         v_scale=v_scale,
         kv_cache_lens=global_kv_cache_lens,
         kv_write_back=True,
+        skip_cache_attn=True,
         # return_lse=True,
     )
 
