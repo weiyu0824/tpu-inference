@@ -324,15 +324,17 @@ def _ragged_paged_attention_kernel_loop(
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
+    lse_hbm_in_ref,  # [actual_num_kv_heads, max_tokens * num_q_heads_per_kv_head, 128] input alias
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     updated_kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
+    lse_hbm_ref,  # [actual_num_kv_heads, max_tokens * num_q_heads_per_kv_head, 128] - 3D LSE output
     # Scratch
     ## Add one extra to handle bank conflicts for strided load if needed.
     bkv_x2_ref,  # [2, bkv_sz, num_kv_heads_x2 // kv_packing (+ 1), kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    sems,  # [4, 2]
+    sems,  # [4, 2] or [5, 2] when return_lse=True
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
@@ -357,6 +359,7 @@ def _ragged_paged_attention_kernel_loop(
     case: RpaCase = RpaCase.MIXED,
     debug_mode: bool = False,
     kv_write_back: bool = True,
+    return_lse: bool = False,
 ):
   assert q_hbm_ref.shape == o_hbm_ref.shape
   assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -1108,6 +1111,28 @@ def _ragged_paged_attention_kernel_loop(
           else lax.div(acc, l)
       ).astype(out_dtype)
 
+      # Emit LSE = m + log(l) for this bq block.
+      if return_lse:
+        # Layout: l_ref/lse_hbm are 3D:
+        #   (actual_num_kv_heads, tokens * nqpkv, 128)
+        bq_q_start = q_start + bq_idx * actual_bq_sz
+        bq_sz_actual = jnp.minimum(actual_bq_sz, q_end - bq_q_start)
+
+        # Compute LSE in-place in l_ref. 
+        l_ref[...] = m_ref[...] + jnp.log(l_ref[...])
+
+        # DMA: flat token-head dim.
+        bq_q_start_flat = bq_q_start * num_q_heads_per_kv_head
+        bq_sz_actual_flat = bq_sz_actual * num_q_heads_per_kv_head
+        if not debug_mode:
+          cp = pltpu.make_async_copy(
+              l_ref.at[:, pl.ds(0, bq_sz_actual_flat), :],
+              lse_hbm_ref.at[:, pl.ds(bq_q_start_flat, bq_sz_actual_flat), :],
+              sems.at[4, 0],
+          )
+          cp.start()
+          cp.wait()
+
       # Wait for previous bo to be fully sent before storing new bo.
       bo_sem_idx = sem_ids_ref[2]
       sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
@@ -1269,7 +1294,7 @@ def dynamic_validate_inputs(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
-    kv_cache_lens: jax.Array , # i32[max_num_seqs]
+    kv_cache_lens: jax.Array | None = None,
     *,
     cp_rank: int | None = None,
     cp_group_size: int | None = None,
@@ -1717,6 +1742,7 @@ def get_default_block_sizes(
         "use_causal_mask",
         "skip_kv_mask",
         "skip_cache_attn",
+        "return_lse",
         "sm_scale",
         "sliding_window",
         "soft_cap",
@@ -1749,7 +1775,7 @@ def ragged_paged_attention(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
-    kv_cache_lens: jax.Array,
+    kv_cache_lens: jax.Array | None = None,
     *,
     cp_rank: jax.Array,  # i32[1] - per-device rank, sharded along the DCP axis
     cp_group_size: int | None = None,
@@ -1762,6 +1788,7 @@ def ragged_paged_attention(
     out_dtype: Any = None,
     mask_value: float | None = None,
     kv_write_back: bool = True,
+    return_lse: bool = False,
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
@@ -1887,6 +1914,13 @@ def ragged_paged_attention(
   pages_per_seq = num_page_indices // max_num_seqs
   num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
 
+  # 3D LSE buffer: (actual_num_kv_heads, max_num_tokens * num_q_heads_per_kv_head, 128).
+  # The heads dim is flattened with tokens for better DMA alignment.
+  lse_hbm = jnp.zeros(
+      (actual_num_kv_heads, max_num_tokens * num_q_heads_per_kv_head, 128),
+      dtype=out_dtype,
+  )
+
   # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
   init_sem_ids = jnp.zeros((3,), jnp.int32)
   # (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
@@ -1904,20 +1938,24 @@ def ragged_paged_attention(
       bkv_csz,
       kv_write_back,
       skip_cache_attn=False,
+      return_lse=False,
+      lse_hbm=None,
       static_q_len=None,
       cp_rank=None,
       cp_group_size=None,
       case: RpaCase = RpaCase.MIXED,
   ):
     in_specs = [
-        pl.BlockSpec(memory_space=pltpu.HBM),
-        pl.BlockSpec(memory_space=pltpu.HBM),
-        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),  # q
+        pl.BlockSpec(memory_space=pltpu.HBM),  # kv
+        pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache
+        pl.BlockSpec(memory_space=pltpu.HBM),  # lse_hbm (always present, aliased)
     ]
 
     out_specs = [
-        pl.BlockSpec(memory_space=pltpu.HBM),
-        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),  # o
+        pl.BlockSpec(memory_space=pltpu.HBM),  # updated_kv_cache
+        pl.BlockSpec(memory_space=pltpu.HBM),  # lse
     ]
 
     bkv_stride = num_kv_heads_x2_per_kv_packing
@@ -1940,7 +1978,10 @@ def ragged_paged_attention(
         (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
         out_dtype,
     )
-    m_scratch = l_scratch
+    m_scratch = pltpu.VMEM(
+        (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+        out_dtype,
+    )
 
     acc_scratch = pltpu.VMEM(
         (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
@@ -1957,7 +1998,7 @@ def ragged_paged_attention(
         bq_double_buf,  # (bq_x2_ref) Double buffering for q block.
         bo_double_buf,  # (bo_x2_ref) Double buffering for output block.
         # Semaphores for double buffering of bkv, bq, bo and bkv_update.
-        pltpu.SemaphoreType.DMA((4, 2)),
+        pltpu.SemaphoreType.DMA((5, 2)), # one for lse
         # Intermediate buffers per kv head for flash attention.
         l_scratch,
         m_scratch,
@@ -2008,6 +2049,7 @@ def ragged_paged_attention(
             case=case,
             debug_mode=debug_mode,
             kv_write_back=kv_write_back,
+            return_lse=return_lse,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalar_prefetches),
@@ -2031,24 +2073,28 @@ def ragged_paged_attention(
         out_shape=[
             pltpu.HBM(shape=q.shape, dtype=q.dtype),
             pltpu.HBM(shape=kv_cache.shape, dtype=kv_cache.dtype),
+            pltpu.HBM(shape=lse_hbm.shape, dtype=lse_hbm.dtype),
         ],
         input_output_aliases={
-            len(scalar_prefetches): 0,
-            len(scalar_prefetches) + 2: 1,
+            len(scalar_prefetches): 0,       # q → o
+            len(scalar_prefetches) + 2: 1,   # kv_cache → updated_kv_cache
+            len(scalar_prefetches) + 3: 2,   # lse_hbm → lse_out
         },
         name=scope_name,
     )
 
     @jax.jit
-    def run(scalar_prefetches, q, kv, kv_cache):
+    def run(scalar_prefetches, q, kv, kv_cache, lse_hbm):
       return kernel(
           *scalar_prefetches,
           pltpu.with_memory_space_constraint(q, pltpu.HBM),
           pltpu.with_memory_space_constraint(kv, pltpu.HBM),
           pltpu.with_memory_space_constraint(kv_cache, pltpu.HBM),
+          pltpu.with_memory_space_constraint(lse_hbm, pltpu.HBM),
       )
 
-    return run(scalar_prefetches, q, kv, kv_cache)
+    q_out, kv_cache_out, lse_out = run(scalar_prefetches, q, kv, kv_cache, lse_hbm)
+    return q_out, kv_cache_out, lse_out
 
   def _prepare_block_sizes(block_sizes, case):
     if block_sizes is None:
@@ -2074,44 +2120,64 @@ def ragged_paged_attention(
     }
 
   # Decode-only
-  q, kv_cache = run_rpa_kernel(
+  q, kv_cache, lse_hbm = run_rpa_kernel(
       q,
       kv_cache,
       **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
       kv_write_back=kv_write_back,
       skip_cache_attn=skip_cache_attn,
+      return_lse=return_lse,
+      lse_hbm=lse_hbm,
       static_q_len=1,
       cp_rank=cp_rank,
       cp_group_size=cp_group_size,
       case=RpaCase.DECODE,
   )
+
   if chunk_prefill_size is not None:
     # Prefill-only
-    q, kv_cache = run_rpa_kernel(
+    q, kv_cache, lse_hbm = run_rpa_kernel(
         q,
         kv_cache,
         **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
         kv_write_back=kv_write_back,
         skip_cache_attn=skip_cache_attn,
+        return_lse=return_lse,
+        lse_hbm=lse_hbm,
         static_q_len=chunk_prefill_size,
         cp_rank=cp_rank,
         cp_group_size=cp_group_size,
         case=RpaCase.PREFILL,
     )
+
   # Mixed
-  q, kv_cache = run_rpa_kernel(
+  q, kv_cache, lse_hbm = run_rpa_kernel(
       q,
       kv_cache,
       **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
       kv_write_back=kv_write_back,
       skip_cache_attn=skip_cache_attn,
+      return_lse=return_lse,
+      lse_hbm=lse_hbm,
       static_q_len=None,
       cp_rank=cp_rank,
       cp_group_size=cp_group_size,
       case=RpaCase.MIXED,
   )
 
-  return (
-      prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
-      kv_cache,
-  )
+  attn_out = prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim)
+
+  if return_lse:
+    # lse_hbm: (actual_num_kv_heads, max_num_tokens * num_q_heads_per_kv_head, 128)
+    # Extract the scalar value (all 128 minor-dim elements are equal) and
+    # reshape to (max_num_tokens, actual_num_q_heads).
+    lse = (
+        lse_hbm[:, :, 0]
+        # (actual_num_kv_heads, max_num_tokens * num_q_heads_per_kv_head)
+        .swapaxes(0, 1)
+        # (max_num_tokens * num_q_heads_per_kv_head, actual_num_kv_heads)
+        .reshape(max_num_tokens, actual_num_q_heads)
+    )
+    return attn_out, kv_cache, lse
+
+  return attn_out, kv_cache
