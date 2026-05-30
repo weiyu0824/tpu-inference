@@ -28,7 +28,6 @@ import jax
         "query_start_loc",
         "request_distribution",
         "mamba_state_indices",
-        "local_kv_lens",
     ],
     meta_fields=[],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
@@ -54,9 +53,6 @@ class AttentionMetadata(object):
     # None for models without mamba layers; pure-mamba models would also
     # use this field, only hybrid models exercise it today.
     mamba_state_indices: jax.Array | None = None
-    # (max_num_seqs,) local sequence length for Decode Context Parallelism (DCP).
-    # Populated dynamically when DCP is enabled.
-    local_kv_lens: jax.Array | None = None
 
     query_start_loc_cpu: Any = field(init=False)
     seq_lens_cpu: Any = field(init=False)
