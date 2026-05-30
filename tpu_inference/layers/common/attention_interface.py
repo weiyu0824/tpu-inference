@@ -425,7 +425,9 @@ def sharded_ragged_paged_attention_experimental(
     kv_write_back: bool = True,
     return_lse: bool = False,
     skip_cache_attn: bool = False,
-    is_context_phase: bool = False
+    skip_current_attn: bool = False,
+    is_context_phase: bool = False,
+    use_causal_mask: bool = True
 ):
     # Determine the Pallas kernel block sizes.
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
@@ -496,7 +498,9 @@ def sharded_ragged_paged_attention_experimental(
             cp_group_size=cp_group_size,
             kv_write_back=kv_write_back,
             skip_cache_attn=skip_cache_attn,
+            skip_current_attn=skip_current_attn,
             return_lse=return_lse,
+            use_causal_mask=use_causal_mask
         )
         return rpa_experimental.ragged_paged_attention(
             *kernel_args,
@@ -556,6 +560,12 @@ def dcp_alltoall(
         # (max_num_tokens, new_local_heads)
 
         weights = jnp.exp(lse_chunks - combined_lse[None])
+        # When all ranks have -inf LSE (e.g. prefill seqs with no cached tokens),
+        # combined_lse=-inf and weights=exp(-inf-(-inf))=NaN.  Zero them out so
+        # combined_out stays 0 and combined_lse stays -inf for those tokens,
+        # letting merge_attn_states fall back to the query-phase result.
+        weights = jnp.where(jnp.isneginf(combined_lse[None, ...]), 0.0, weights)
+        
         # (dcp, max_num_tokens, new_local_heads)
 
         combined_out = jnp.einsum('d t h, d t h f -> t h f', weights, attn_chunks)
@@ -566,17 +576,16 @@ def dcp_alltoall(
     return jax.shard_map(
         _inner,
         mesh=mesh,
-        # TODO:first Axis should be data+dcp_axis
+        # NOTE:(weiyulin) attn_out is 3D (tokens, heads, head_dim); lse is 2D (tokens, heads).
         in_specs=(
-            P(dcp_axis, ShardingAxisName.KV_CACHE_HEAD),
+            P(dcp_axis, ShardingAxisName.KV_CACHE_HEAD, None),
             P(dcp_axis, ShardingAxisName.KV_CACHE_HEAD),
         ),
         out_specs=(
-            P(None, ShardingAxisName.ATTN_HEAD),
+            P(None, ShardingAxisName.ATTN_HEAD, None),
             P(None, ShardingAxisName.ATTN_HEAD),
         ),
         check_vma=False,
-        # check_rep=False,
     )(attn_out, lse)
 
 def merge_attn_states(
@@ -642,7 +651,7 @@ def forward_with_dcp(
     # inserts for each of the 94 layers (38 simultaneous copies = 8.5G HLO
     # temp) when Phase 3 is alive, preventing the compile-time HBM OOM.
     # ==========================================================================
-    q_len_per_seq = md.query_start_loc[1:] - md.query_start_loc[:-1]
+    q_len_per_seq = jnp.maximum(0, md.query_start_loc[1:] - md.query_start_loc[:-1])
     global_kv_cache_lens = md.seq_lens - q_len_per_seq
 
     query_attn_out, updated_kv_cache, query_lse = sharded_ragged_paged_attention_experimental(
@@ -692,6 +701,8 @@ def forward_with_dcp(
         kv_write_back=False,
         is_context_phase=True,
         return_lse=True,
+        skip_current_attn=True,
+        use_causal_mask=False
     )
 
     context_attn_out_cor, context_lse_cor = dcp_alltoall(context_attn_out, context_lse, mesh=mesh)
