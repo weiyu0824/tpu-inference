@@ -748,7 +748,6 @@ def attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    sinks: jax.Array | None = None,
     update_kv_cache: bool = True,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
