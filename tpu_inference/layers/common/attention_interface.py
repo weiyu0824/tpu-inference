@@ -658,16 +658,44 @@ def forward_with_dcp(
 
     md = attention_metadata
 
-    # ==========================================================================
-    # Phase 2: Query Attention (Attending to current tokens K, V)
-    # Run Phase 2 FIRST so Phase 1 can read from updated_kv_cache instead of
-    # the aliased kv_cache arg. This eliminates the kv_cache copy that XLA
-    # inserts for each of the 94 layers (38 simultaneous copies = 8.5G HLO
-    # temp) when Phase 3 is alive, preventing the compile-time HBM OOM.
-    # ==========================================================================
+
     q_len_per_seq = jnp.maximum(0, md.query_start_loc[1:] - md.query_start_loc[:-1])
     global_kv_cache_lens = md.seq_lens - q_len_per_seq
 
+    # ==========================================================================
+    # Phase 1: Context Attention (Attending to KV caches)
+    # `kv_caches` is not modified in the phase.
+    # ==========================================================================
+
+    context_attn_out, kv_cache, context_lse = sharded_ragged_paged_attention_experimental(
+        mesh=mesh,
+        q=q,
+        k=k,
+        v=v,
+        kv_cache=kv_cache,
+        kv_lens=md.seq_lens,
+        paged_indices=md.block_tables,
+        cu_q_lens=md.query_start_loc,
+        distribution=md.request_distribution,
+        attention_sink=sinks,
+        sm_scale=sm_scale,
+        attention_chunk_size=attention_chunk_size,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_cache_lens=global_kv_cache_lens,
+        kv_write_back=False,
+        is_context_phase=True,
+        return_lse=True,
+        skip_current_attn=True,
+        use_causal_mask=False
+    )
+
+    context_attn_out_cor, context_lse_cor = dcp_alltoall(context_attn_out, context_lse, mesh=mesh) 
+
+    # ==========================================================================
+    # Phase 2: Query Attention (Attending to current tokens K, V)
+    # ==========================================================================
     query_attn_out, updated_kv_cache, query_lse = sharded_ragged_paged_attention_experimental(
         mesh=mesh,
         q=q,
@@ -689,37 +717,6 @@ def forward_with_dcp(
         skip_cache_attn=True,
         return_lse=True,
     )
-
-    # ==========================================================================
-    # Phase 1: Context Attention (Attending to KV caches)
-    # Reads from updated_kv_cache (output of Phase 2) so XLA does not alias
-    # the same buffer for both a read (Phase 1) and an aliased write (Phase 2).
-    # ==========================================================================
-    context_attn_out, _, context_lse = sharded_ragged_paged_attention_experimental(
-        mesh=mesh,
-        q=q,
-        k=k,
-        v=v,
-        kv_cache=updated_kv_cache,
-        kv_lens=md.seq_lens,
-        paged_indices=md.block_tables,
-        cu_q_lens=md.query_start_loc,
-        distribution=md.request_distribution,
-        attention_sink=sinks,
-        sm_scale=sm_scale,
-        attention_chunk_size=attention_chunk_size,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        kv_cache_lens=global_kv_cache_lens,
-        kv_write_back=False,
-        is_context_phase=True,
-        return_lse=True,
-        skip_current_attn=True,
-        use_causal_mask=False
-    )
-
-    context_attn_out_cor, context_lse_cor = dcp_alltoall(context_attn_out, context_lse, mesh=mesh)
 
     # ==========================================================================
     # Phase 3: Combine Context and Query results
