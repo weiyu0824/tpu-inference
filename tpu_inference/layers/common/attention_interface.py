@@ -434,7 +434,7 @@ def sharded_ragged_paged_attention_experimental(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    kv_cache_lens: jax.Array | None = None,
+    # kv_cache_lens: jax.Array | None = None,
     # Flags for CP
     kv_write_back: bool = True,
     return_lse: bool = False,
@@ -483,11 +483,11 @@ def sharded_ragged_paged_attention_experimental(
         P(ShardingAxisName.ATTN_DATA),  # page_indices
         P(ShardingAxisName.ATTN_DATA),  # cu_q_lens
         P(ShardingAxisName.ATTN_DATA),  # distribution
-        P(ShardingAxisName.ATTN_DATA),  # kv_cache_lens
+        # P(ShardingAxisName.ATTN_DATA),  # kv_cache_lens
         P(ShardingAxisName.CONTEXT),    # cp_rank - each device gets its rank
     ]
 
-    args = [q, k, v, kv_cache, kv_lens, paged_indices, cu_q_lens, distribution, kv_cache_lens, cp_rank_global]
+    args = [q, k, v, kv_cache, kv_lens, paged_indices, cu_q_lens, distribution, cp_rank_global]
 
     lse_spec = (
         P(('data', 'attn_dp', 'dcp'), ShardingAxisName.KV_CACHE_HEAD)
@@ -531,28 +531,27 @@ def sharded_ragged_paged_attention_experimental(
 
 
 def dcp_alltoall(
-    attn_out: jax.Array,  # P('decode-cp', 'model'): (max_num_tokens, heads//model, head_dim)
-    lse: jax.Array,       # P('decode-cp', 'model'): (max_num_tokens, heads//model)
+    attn_out: jax.Array,  # P('dcp', 'model'): local_shape=(max_num_tokens, heads/model, head_dim)
+    lse: jax.Array,       # P('dcp', 'model'): local_shape=(max_num_tokens, heads/model)
     mesh: Mesh,
     dcp_axis: str = 'dcp',
     model_axis: str = 'model',
 ) -> tuple[jax.Array, jax.Array]:
 
     def _inner(attn_out, lse):
-        # local shape: (max_num_tokens, heads//model, head_dim)
         dcp_size = jax.lax.psum(1, axis_name=dcp_axis)
         max_num_tokens = attn_out.shape[0]
         local_heads = attn_out.shape[1]
         head_dim = attn_out.shape[2]
 
-        # Step 1: all-to-all across decode-cp
+        # Step 1: all-to-all across dcp
         attn_gathered = jax.lax.all_to_all(
             attn_out,
             axis_name=dcp_axis,
             split_axis=1,   # split heads
             concat_axis=0,  # concat tokens
             tiled=True,
-        )  # → (max_num_tokens*dcp, heads//(model*dcp), head_dim)
+        )  # -> (max_num_tokens*dcp, heads/(model*dcp), head_dim)
 
         lse_gathered = jax.lax.all_to_all(
             lse,
@@ -560,28 +559,23 @@ def dcp_alltoall(
             split_axis=1,   # split heads
             concat_axis=0,  # concat tokens
             tiled=True,
-        )  # → (max_num_tokens*dcp, heads//(model*dcp))
+        )  # -> (max_num_tokens*dcp, heads/(model*dcp))
 
-        # Step 2: reshape để expose dcp chunks
-        # (max_num_tokens*dcp, local_heads//dcp, head_dim)
-        # → (dcp, max_num_tokens, local_heads//dcp, head_dim)
+        # Step 2: Reshape and make shape[0]=dcp_size
         new_local_heads = local_heads // dcp_size
         attn_chunks = attn_gathered.reshape(dcp_size, max_num_tokens, new_local_heads, head_dim)
         lse_chunks  = lse_gathered.reshape(dcp_size, max_num_tokens, new_local_heads)
 
-        # Step 3: lse correction
+        # Step 3: Local lse correction
         combined_lse = jax.nn.logsumexp(lse_chunks, axis=0)
-        # (max_num_tokens, new_local_heads)
 
         weights = jnp.exp(lse_chunks - combined_lse[None])
-        # When all ranks have -inf LSE (e.g. prefill seqs with no cached tokens),
+        # NOTE(weiyulin): When all ranks have -inf LSE (e.g. prefill seqs with no cached tokens),
         # combined_lse=-inf and weights=exp(-inf-(-inf))=NaN.  Zero them out so
         # combined_out stays 0 and combined_lse stays -inf for those tokens,
         # letting merge_attn_states fall back to the query-phase result.
         weights = jnp.where(jnp.isneginf(combined_lse[None, ...]), 0.0, weights)
         
-        # (dcp, max_num_tokens, new_local_heads)
-
         combined_out = jnp.einsum('d t h, d t h f -> t h f', weights, attn_chunks)
         # (max_num_tokens, new_local_heads, head_dim)
 
@@ -590,7 +584,6 @@ def dcp_alltoall(
     return jax.shard_map(
         _inner,
         mesh=mesh,
-        # NOTE:(weiyulin) attn_out is 3D (tokens, heads, head_dim); lse is 2D (tokens, heads).
         in_specs=(
             P(dcp_axis, ShardingAxisName.KV_CACHE_HEAD, None),
             P(dcp_axis, ShardingAxisName.KV_CACHE_HEAD),
@@ -635,7 +628,7 @@ def forward_with_dcp(
     v: jax.Array,
     attention_metadata: AttentionMetadata,
     mesh: Mesh,
-    head_dim_original: int | None = None,  # before padding,
+    head_dim_original: int | None = None,
     sm_scale: float | None = None,
     sinks: jax.Array | None = None,
     attention_chunk_size: int | None = None,
@@ -644,7 +637,7 @@ def forward_with_dcp(
     v_scale: float | None = None,
     ):
     """
-    Distributed Context Parallelism (DCP) Attention forward pass.
+    DCP Attention forward pass.
 
     Phase 1: Context Attention (Attending to KV caches)
     Phase 2: Query Attention (Attending to current tokens K, V)
@@ -659,8 +652,8 @@ def forward_with_dcp(
     md = attention_metadata
 
 
-    q_len_per_seq = jnp.maximum(0, md.query_start_loc[1:] - md.query_start_loc[:-1])
-    global_kv_cache_lens = md.seq_lens - q_len_per_seq
+    # q_len_per_seq = jnp.maximum(0, md.query_start_loc[1:] - md.query_start_loc[:-1])
+    # global_kv_cache_lens = md.seq_lens - q_len_per_seq
 
     # ==========================================================================
     # Phase 1: Context Attention (Attending to KV caches)
@@ -683,7 +676,7 @@ def forward_with_dcp(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
-        kv_cache_lens=global_kv_cache_lens,
+        # kv_cache_lens=global_kv_cache_lens,
         kv_write_back=False,
         is_context_phase=True,
         return_lse=True,
@@ -712,7 +705,7 @@ def forward_with_dcp(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
-        kv_cache_lens=global_kv_cache_lens,
+        # kv_cache_lens=global_kv_cache_lens,
         kv_write_back=True,
         skip_cache_attn=True,
         return_lse=True,
@@ -785,7 +778,6 @@ def attention(
         )
 
     # (T, N, H)
-
     output, kv_cache = sharded_ragged_paged_attention(
         mesh,
         q,
