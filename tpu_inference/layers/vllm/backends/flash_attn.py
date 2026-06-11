@@ -16,17 +16,25 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
                                                  register_backend)
 
 from tpu_inference import utils
+from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
+    get_smem_estimate_bytes
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
+from tpu_inference.runner.utils import MIN_NUM_SEQS
 
 logger = init_logger(__name__)
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
+
+# In recent TPU generations, up to v6e, the SMEM size is 1MB. We
+# conservatively budget half of that for the RPA kernel's scalar inputs
+# (page_indices, kv_lens, etc.), leaving the other half for everything else.
+SMEM_BUDGET_BYTES = 1024 * 1024 // 2
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
@@ -61,17 +69,31 @@ class PallasAttentionBackend(AttentionBackend):
         raise RuntimeError("swap_blocks is not used for the TPU backend.")
 
     # In recent TPU generations, up to v6e, the SMEM size is 1MB. The
-    # block_tables within the PallasMetadata constitute almost the entire SMEM
-    # requirement. Its size is max_num_seqs * num_page_per_seq * 4 (Int). Here
-    # we simply make sure that the size is smaller than half of SMEM capacity.
+    # block_tables (page_indices) within the PallasMetadata constitute
+    # almost the entire SMEM requirement, but kv_lens/cu_q_lens/etc. also
+    # contribute a small fixed amount. Here we search for the smallest
+    # page_size whose total SMEM usage (per get_smem_estimate_bytes) fits
+    # within SMEM_BUDGET_BYTES.
     @staticmethod
     def get_min_page_size(vllm_config: VllmConfig) -> int:
-        max_num_page_per_req = (1024 * 1024 // 2 //
-                                vllm_config.scheduler_config.max_num_seqs // 4)
-        min_page_size = cdiv(vllm_config.model_config.max_model_len,
-                             max_num_page_per_req)
-        min_page_size = 1 << (min_page_size - 1).bit_length()
-        return min_page_size
+        # The kernel's max_num_seqs is padded up from the per-DP-replica
+        # scheduler max_num_seqs, see tpu_runner.py's max_num_reqs.
+        max_num_seqs = max(
+            vllm_config.sharding_config.total_dp_size *
+            vllm_config.scheduler_config.max_num_seqs, MIN_NUM_SEQS)
+        # With decode context parallelism, each device only stores 1/cp_size
+        # of a sequence's KV cache pages, so page_indices is correspondingly
+        # smaller.
+        cp_size = vllm_config.parallel_config.decode_context_parallel_size
+
+        page_size = 16
+        while True:
+            pages_per_seq = cdiv(vllm_config.model_config.max_model_len,
+                                 page_size * cp_size)
+            if get_smem_estimate_bytes(max_num_seqs,
+                                       pages_per_seq) <= SMEM_BUDGET_BYTES:
+                return page_size
+            page_size *= 2
 
     @staticmethod
     def get_max_num_seqs(model_len: int, page_size: int) -> int:
