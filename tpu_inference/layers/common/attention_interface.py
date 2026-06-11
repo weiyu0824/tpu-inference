@@ -28,7 +28,7 @@ from jax.sharding import PartitionSpec as P
 from jax.sharding import Sharding
 
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
-import tpu_inference.kernels.experimental.context_parallelism_rpa.kernel as rpa_experimental
+# import tpu_inference.kernels.experimental.context_parallelism_rpa.kernel as rpa_experimental
 from tpu_inference import envs
 from tpu_inference.kernels.flash_attention.kernel import flash_attention
 from tpu_inference.kernels.mla.v2.kernel import mla_ragged_paged_attention
@@ -436,7 +436,7 @@ def sharded_ragged_paged_attention_experimental(
     v_scale: float | None = None,
     # kv_cache_lens: jax.Array | None = None,
     # Flags for CP
-    kv_write_back: bool = True,
+    update_kv_cache: bool = True,
     return_lse: bool = False,
     skip_cache_attn: bool = False,
     skip_current_attn: bool = False,
@@ -510,13 +510,13 @@ def sharded_ragged_paged_attention_experimental(
             v_scale=v_scale,
             cp_rank=cp_rank,
             cp_group_size=cp_group_size,
-            kv_write_back=kv_write_back,
+            update_kv_cache=update_kv_cache,
             skip_cache_attn=skip_cache_attn,
             skip_current_attn=skip_current_attn,
             return_lse=return_lse,
             use_causal_mask=use_causal_mask
         )
-        return rpa_experimental.ragged_paged_attention(
+        return rpa.ragged_paged_attention(
             *kernel_args,
             **kwargs
         )
@@ -677,7 +677,7 @@ def forward_with_dcp(
         k_scale=k_scale,
         v_scale=v_scale,
         # kv_cache_lens=global_kv_cache_lens,
-        kv_write_back=False,
+        update_kv_cache=False,
         is_context_phase=True,
         return_lse=True,
         skip_current_attn=True,
@@ -706,7 +706,7 @@ def forward_with_dcp(
         k_scale=k_scale,
         v_scale=v_scale,
         # kv_cache_lens=global_kv_cache_lens,
-        kv_write_back=True,
+        update_kv_cache=True,
         skip_cache_attn=True,
         return_lse=True,
     )
