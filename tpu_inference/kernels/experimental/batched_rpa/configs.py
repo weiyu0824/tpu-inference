@@ -65,6 +65,7 @@ class ServingConfigs:
     scale_q: int | None = None
     scale_k: int | None = None
     scale_v: int | None = None
+    cp_group_size: int | None = None
 
     @property
     def pages_per_seq(self) -> int:
@@ -138,6 +139,7 @@ class RpaConfigs:
     serve: ServingConfigs
     mode: RpaCase
     vmem_limit_bytes: int
+    return_lse: bool = False
 
     # Expose block sizes for ease of use.
 
@@ -276,6 +278,29 @@ class RpaConfigs:
             self.model.num_kv_heads,
             self.block.bq_sz * self.model.num_q_heads_per_kv_head,
             num_lanes,
+        )
+
+    @property
+    def lse_shape(self):
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        nqpkv = self.model.num_q_heads_per_kv_head
+        return (
+            self.model.num_kv_heads,
+            self.serve.total_q_tokens * nqpkv,
+            num_lanes,
+        )
+
+    @property
+    def kv_shuffle_shape(self):
+        cp_group_size = self.serve.cp_group_size
+        if cp_group_size is None:
+            return None
+        return (
+            self.block.batch_size,
+            self.block.bkv_sz // cp_group_size,
+            self.kv_hbm_stride,
+            self.serve.packing_kv,
+            self.model.head_dim,
         )
 
     @property

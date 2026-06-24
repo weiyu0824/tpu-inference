@@ -75,8 +75,8 @@ class KVBufferedRef(_BypassRef):
         src_ref: tuple[jax.Ref, jax.Ref, schedule.RpaSchedule, jax.Ref],
         grid_indices: tuple[int | jax.Array, ...],
     ):
-        # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref)
-        kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref = src_ref
+        # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref[, kv_shuffle_ref])
+        kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref = src_ref[:4]
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_dst = self.window_ref.at[slot, :, :, :self.cfgs.kv_hbm_stride]
@@ -124,7 +124,13 @@ class KVBufferedRef(_BypassRef):
         dst_ref: tuple[jax.Ref, jax.Ref, schedule.RpaSchedule, jax.Ref],
         grid_indices: tuple[int | jax.Array, ...],
     ):
-        kv_out_ref, _, schedule_ref, page_indices_ref = dst_ref
+        cp_group_size = self.cfgs.serve.cp_group_size
+        use_shuffle = cp_group_size is not None
+        if use_shuffle:
+            kv_out_ref, _, schedule_ref, page_indices_ref, kv_shuffle_ref, cp_rank_ref = dst_ref
+            cp_rank = cp_rank_ref[0]
+        else:
+            kv_out_ref, _, schedule_ref, page_indices_ref = dst_ref
         kv_out_ref_flat = kv_out_ref.reshape(-1, *kv_out_ref.shape[2:])
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
@@ -140,19 +146,49 @@ class KVBufferedRef(_BypassRef):
                 p_off = encoded_dst_hbm_off & self.cfgs.serve.page_size_mask
                 dst_hbm_off = (page_indices_ref[global_p_idx] <<
                                self.cfgs.serve.page_size_log2) | p_off
-                sz = jnp.where(do_writeback, new_sz, 0)
-                pltpu.make_async_copy(
-                    vmem_src.at[b, pl.ds(src_vmem_off, sz)],
-                    kv_out_ref_flat.at[pl.ds(dst_hbm_off, sz)],
-                    sem,
-                ).start()
+                if use_shuffle:
+                    local_sz = (new_sz + cp_group_size - 1 - cp_rank) // cp_group_size
+                    sz = jnp.where(do_writeback, local_sz, 0)
+                    # VPU zeros the entire destination when any source index is
+                    # OOB, so the static gather size must be in-bounds.
+                    # DECODE (bkv_p_new=1): at most 1 new token → size 1.
+                    # MIXED (bkv_p_new>1): skip_cache_attn puts new KV at
+                    # src_vmem_off = i*page_size, so page_size elements fit.
+                    if self.cfgs.bkv_p_new == 1:
+                        static_sz = 1
+                    else:
+                        static_sz = self.cfgs.serve.page_size // cp_group_size
+                    shuffle_off = i * static_sz
+
+                    # Strided loads in Mosaic require 32-bit elements. Bitcast both refs to
+                    # uint32 so the packed kv_packing dim collapses out of the layout.
+                    kv_shuffle_u32 = kv_shuffle_ref.at[b].bitcast(jnp.uint32)
+                    vmem_src_u32 = vmem_src.at[b].bitcast(jnp.uint32)
+
+                    kv_shuffle_u32[pl.ds(shuffle_off, static_sz)] = (
+                        vmem_src_u32[
+                            pl.ds(src_vmem_off + cp_rank, static_sz, cp_group_size)
+                        ]
+                    )
+                    pltpu.make_async_copy(
+                        kv_shuffle_ref.at[b, pl.ds(shuffle_off, sz)],
+                        kv_out_ref_flat.at[pl.ds(dst_hbm_off, sz)],
+                        sem,
+                    ).start()
+                else:
+                    sz = jnp.where(do_writeback, new_sz, 0)
+                    pltpu.make_async_copy(
+                        vmem_src.at[b, pl.ds(src_vmem_off, sz)],
+                        kv_out_ref_flat.at[pl.ds(dst_hbm_off, sz)],
+                        sem,
+                    ).start()
 
     def wait_in(
         self,
         src_ref: tuple[jax.Ref, jax.Ref, schedule.RpaSchedule, jax.Ref],
         grid_indices: tuple[int | jax.Array, ...],
     ):
-        _, _, schedule_ref, _ = src_ref
+        _, _, schedule_ref, _ = src_ref[:4]
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_dst = self.window_ref.at[slot]
@@ -182,7 +218,13 @@ class KVBufferedRef(_BypassRef):
         dst_ref: tuple[jax.Ref, jax.Ref, schedule.RpaSchedule, jax.Ref],
         grid_indices: tuple[int | jax.Array, ...],
     ):
-        kv_out_ref, _, schedule_ref, _ = dst_ref
+        cp_group_size = self.cfgs.serve.cp_group_size
+        use_shuffle = cp_group_size is not None
+        if use_shuffle:
+            kv_out_ref, _, schedule_ref, _, _, cp_rank_ref = dst_ref
+            cp_rank = cp_rank_ref[0]
+        else:
+            kv_out_ref, _, schedule_ref, _ = dst_ref[:4]
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
@@ -192,10 +234,13 @@ class KVBufferedRef(_BypassRef):
             do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
             for i in range(self.cfgs.bkv_p_new):
                 _, _, _, new_sz = schedule_ref.get_dma_kv_new(block_idx, b, i)
-                sz = jnp.where(do_writeback, new_sz, 0)
+                if use_shuffle:
+                    local_sz = (new_sz + cp_group_size - 1 - cp_rank) // cp_group_size
+                    sz = jnp.where(do_writeback, local_sz, 0)
+                else:
+                    sz = jnp.where(do_writeback, new_sz, 0)
                 total_sz += sz
 
-        # Flatten to 2D: (Total_Rows, Head_Dim)
         flat_ref = kv_out_ref.reshape((-1, *kv_out_ref.shape[2:]))
         pltpu.make_async_copy(
             flat_ref.at[pl.ds(0, total_sz)],

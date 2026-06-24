@@ -167,15 +167,15 @@ def compute_metadata(
     *,
     cfgs: configs.RpaConfigs,
     update_kv_cache: bool = True,
+    skip_cache_attn: bool = False,
 ):
     """Fill metadata using triple nested loop of seq->q->k loop.
 
-    When `update_kv_cache=False` (KV-share path): the current step's
-    K/V tokens are NOT pulled from the input k/v tensors, the whole
-    `kv_len` is read from the (redirected) cache slot, and `do_writeback`
-    is forced to 0 so the kernel doesn't overwrite the source layer's
-    cache contents. Mirrors the v3 RPA kernel's `update_kv_cache=False`
-    semantics.
+    When `update_kv_cache=False`: new tokens are not written to cache and
+    only cached tokens (prefix) are read, matching v3 RPA semantics.
+
+    When `skip_cache_attn=True`: only attend to new tokens (Q×Q attention),
+    write new KV to cache. Used for CP phase-1 (current-token attention).
     """
 
     @jax.named_scope("k_loop")
@@ -191,6 +191,7 @@ def compute_metadata(
         q_sz_task,
         k_len,
         q_len,
+        kv_len_actual,
         end_k_idx,
     ):
 
@@ -207,14 +208,19 @@ def compute_metadata(
         kv_len_start = k_idx * cfgs.bkv_sz
         kv_p_start = k_idx * cfgs.bkv_p
         kv_left = k_len - kv_len_start
-        if update_kv_cache:
+        if skip_cache_attn:
+            # Phase-1 CP: only attend to new tokens, no cache read.
+            kv_left_frm_cache = 0
+            # Actual cache write position = prefix_len + offset_within_new_tokens.
+            cache_base = (kv_len_actual - q_len) + kv_len_start
+        elif update_kv_cache:
             kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+            cache_base = kv_len_start
         else:
-            # KV-share: read everything from cache; the source layer's
-            # call ran earlier in this step and already wrote the
-            # current-step K/V into the (redirected) cache slot. The
-            # shared layer's locally-computed k/v is unused.
-            kv_left_frm_cache = kv_left
+            # Phase-2 CP / update_kv_cache=False: read only prefix tokens
+            # (matches v3 semantics).
+            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+            cache_base = kv_len_start
         p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
 
         for i in range(cfgs.bkv_p_cache):
@@ -247,9 +253,9 @@ def compute_metadata(
             dst_vmem = bkv_sz_cache
             dma_sz = new_sz
 
-            p_idx = (kv_len_start + dst_vmem) >> cfgs.serve.page_size_log2
+            p_idx = (cache_base + dst_vmem) >> cfgs.serve.page_size_log2
             p_idx = jnp.minimum(p_idx, cfgs.serve.pages_per_seq - 1)
-            p_off = (kv_len_start + dst_vmem) & cfgs.serve.page_size_mask
+            p_off = (cache_base + dst_vmem) & cfgs.serve.page_size_mask
             global_p_idx = s_idx * cfgs.serve.pages_per_seq + p_idx
 
             dst_hbm = (global_p_idx << cfgs.serve.page_size_log2) | p_off
@@ -266,9 +272,9 @@ def compute_metadata(
                 end_in_slot = jnp.minimum(slot_end, bkv_sz_cache + new_sz)
                 dma_sz = jnp.maximum(0, end_in_slot - dst_vmem)
 
-                p_idx = (kv_len_start + dst_vmem) >> cfgs.serve.page_size_log2
+                p_idx = (cache_base + dst_vmem) >> cfgs.serve.page_size_log2
                 p_idx = jnp.minimum(p_idx, cfgs.serve.pages_per_seq - 1)
-                p_off = (kv_len_start + dst_vmem) & cfgs.serve.page_size_mask
+                p_off = (cache_base + dst_vmem) & cfgs.serve.page_size_mask
                 global_p_idx = s_idx * cfgs.serve.pages_per_seq + p_idx
 
                 dst_hbm = (global_p_idx << cfgs.serve.page_size_log2) | p_off
@@ -280,7 +286,7 @@ def compute_metadata(
         return step + 1
 
     @jax.named_scope("q_loop")
-    def q_loop(q_idx, _, *, s_idx, q_start, q_end, k_len, q_len, num_k):
+    def q_loop(q_idx, _, *, s_idx, q_start, q_end, k_len, q_len, kv_len_actual, num_k):
         target_lane = 0
         min_len = lane_lengths_ref[0]
         for b in range(1, cfgs.batch_size):
@@ -311,6 +317,7 @@ def compute_metadata(
             q_sz_task=q_sz_task,
             k_len=k_len,
             q_len=q_len,
+            kv_len_actual=kv_len_actual,
             end_k_idx=end_k_idx,
         )
         lane_lengths_ref[target_lane] = jax.lax.fori_loop(
@@ -320,8 +327,13 @@ def compute_metadata(
     def seq_loop(s_idx, _):
         q_start = cu_q_lens_ref[s_idx]
         q_end = cu_q_lens_ref[s_idx + 1]
-        k_len = kv_lens_ref[s_idx]
         q_len = q_end - q_start
+        kv_len_actual = kv_lens_ref[s_idx]
+        if skip_cache_attn:
+            # Only attend to current (new) tokens — effective KV length = q_len.
+            k_len = q_len
+        else:
+            k_len = kv_len_actual
 
         num_q = pl.cdiv(q_len, cfgs.bq_sz)
         num_k = pl.cdiv(k_len, cfgs.bkv_sz)
@@ -333,6 +345,7 @@ def compute_metadata(
             q_end=q_end,
             k_len=k_len,
             q_len=q_len,
+            kv_len_actual=kv_len_actual,
             num_k=num_k,
         )
 
@@ -356,6 +369,7 @@ def rpa_metadata_schedule_kernel(
     *,
     cfgs: configs.RpaConfigs,
     update_kv_cache: bool = True,
+    skip_cache_attn: bool = False,
 ):
     """Generates the HBM-to-VMEM DMA schedule.
 
@@ -398,6 +412,7 @@ def rpa_metadata_schedule_kernel(
         lane_lengths_ref,
         cfgs=cfgs,
         update_kv_cache=update_kv_cache,
+        skip_cache_attn=skip_cache_attn,
     )
 
     # Step 2: Compute actual number of steps.
@@ -466,13 +481,15 @@ def generate_rpa_metadata(
     *,
     interpret=False,
     update_kv_cache: bool = True,
+    skip_cache_attn: bool = False,
 ) -> RpaSchedule:
     schedule_shaped_dtype = RpaSchedule.create_shape_dtype(cfgs)
 
     return pl.pallas_call(
         functools.partial(rpa_metadata_schedule_kernel,
                           cfgs=cfgs,
-                          update_kv_cache=update_kv_cache),
+                          update_kv_cache=update_kv_cache,
+                          skip_cache_attn=skip_cache_attn),
         out_shape=schedule_shaped_dtype,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
