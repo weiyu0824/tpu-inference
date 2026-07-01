@@ -89,9 +89,17 @@ class KVCacheManager:
             num_kv_heads: int,
             head_size: int,
             sliding_window: bool | None = None) -> KVCacheSpec:
+        # block_size is the logical (raw) granularity passed to vLLM.
+        # The physical TPU page spans block_size * dcp tokens because the DCP
+        # axis shards the sequence dimension. page_size_padded must reflect
+        # this physical footprint for correct HBM accounting while
+        # block_size in the spec stays raw so vLLM's single DCP multiplication
+        # yields the correct hash and allocation granularity.
+        dcp = self.runner.vllm_config.parallel_config.decode_context_parallel_size
+        physical_block_size = block_size * dcp
         if self.use_mla:
             page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.mesh, physical_block_size, num_kv_heads, head_size,
                 self.runner.kv_cache_dtype, True)
             page_size_padded = (self._hybrid_uniform_page_size_bytes
                                 if self._hybrid_uniform_page_size_bytes
@@ -105,7 +113,7 @@ class KVCacheManager:
                                     page_size_padded=page_size_padded)
         else:
             page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, block_size, num_kv_heads, head_size,
+                self.runner.mesh, physical_block_size, num_kv_heads, head_size,
                 self.runner.kv_cache_dtype, False)
             page_size_padded = (self._hybrid_uniform_page_size_bytes
                                 if self._hybrid_uniform_page_size_bytes
@@ -423,9 +431,12 @@ class KVCacheManager:
             avail / (2**30))
 
     def get_kv_cache_spec(self):
-        # TODO(xiang): this hack tricks engine core to init successfully
+        # Pass the raw (logical) block_size to vLLM. vLLM's
+        # SingleTypeKVCacheManager and resolve_kv_cache_block_sizes both
+        # multiply by dcp internally, so if we pre-multiply here we'd
+        # end up with dcp² — causing hash granularity to be dcp× too coarse
+        # and breaking prefix caching with DCP > 1.
         block_size = self.runner.cache_config.block_size
-        block_size *= self.runner.vllm_config.parallel_config.decode_context_parallel_size
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
         tp_axis_name = ShardingAxisName.ATTN_HEAD
@@ -627,8 +638,13 @@ class KVCacheManager:
 
     def maybe_reinitialize_input_batch(self,
                                        kv_cache_config: KVCacheConfig) -> None:
+        dcp = self.runner.vllm_config.parallel_config.decode_context_parallel_size
+        # kv_cache_spec.block_size is the logical (raw) block size.
+        # The attention kernel indexes the block table at physical granularity
+        # (block_size * dcp tokens per entry), so the InputBatch block table
+        # must be sized accordingly.
         block_sizes = [
-            kv_cache_group.kv_cache_spec.block_size
+            kv_cache_group.kv_cache_spec.block_size * dcp
             for kv_cache_group in kv_cache_config.kv_cache_groups
         ]
         if block_sizes != [self.runner.cache_config.block_size]:
@@ -738,8 +754,9 @@ class KVCacheManager:
                         total_group_page_size += dataclasses.replace(
                             spec, page_size_padded=None).page_size_bytes
                     else:
+                        _dcp = self.runner.vllm_config.parallel_config.decode_context_parallel_size
                         total_group_page_size += get_attention_page_size_bytes(
-                            self.runner.mesh, spec.block_size,
+                            self.runner.mesh, spec.block_size * _dcp,
                             spec.num_kv_heads, spec.head_size, spec.dtype,
                             self.use_mla)
                 num_blocks = kv_cache_tensor.size // total_group_page_size
@@ -837,9 +854,10 @@ class KVCacheManager:
                         else:
                             head_size = layer_spec.head_size
 
+                        _dcp = self.runner.vllm_config.parallel_config.decode_context_parallel_size
                         kv_cache = create_kv_caches(
                             num_blocks=num_blocks,
-                            block_size=layer_spec.block_size,
+                            block_size=layer_spec.block_size * _dcp,
                             num_kv_heads=layer_spec.num_kv_heads,
                             head_size=head_size,
                             mesh=self.runner.mesh,
