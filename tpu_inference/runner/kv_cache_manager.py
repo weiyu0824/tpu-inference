@@ -106,6 +106,10 @@ class KVCacheManager:
             num_kv_heads: int,
             head_size: int,
             sliding_window: bool | None = None) -> KVCacheSpec:
+        # get_attention_page_size_bytes calls get_kv_cache_shape_with_mesh,
+        # which now applies DCP scaling internally via the mesh CONTEXT axis.
+        # Callers pass the raw logical block_size; no manual dcp multiplication
+        # needed here.
         if self.use_mla:
             page_size_bytes = get_attention_page_size_bytes(
                 self.runner.mesh, block_size, num_kv_heads, head_size,
@@ -440,9 +444,12 @@ class KVCacheManager:
             avail / (2**30))
 
     def get_kv_cache_spec(self):
-        # TODO(xiang): this hack tricks engine core to init successfully
+        # Pass the raw (logical) block_size to vLLM. vLLM's
+        # SingleTypeKVCacheManager and resolve_kv_cache_block_sizes both
+        # multiply by dcp internally, so if we pre-multiply here we'd
+        # end up with dcp² — causing hash granularity to be dcp× too coarse
+        # and breaking prefix caching with DCP > 1.
         block_size = self.runner.cache_config.block_size
-        block_size *= self.runner.vllm_config.parallel_config.decode_context_parallel_size
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
         tp_axis_name = ShardingAxisName.ATTN_HEAD
@@ -671,8 +678,14 @@ class KVCacheManager:
 
     def maybe_reinitialize_input_batch(self,
                                        kv_cache_config: KVCacheConfig) -> None:
+        # kv_cache_spec.block_size is the logical (raw) per-rank value.
+        # The block table must be sized at physical granularity: one entry
+        # covers block_size * dcp tokens globally. Read dcp from the mesh
+        # (CONTEXT axis) to stay consistent with get_kv_cache_shape_with_mesh.
+        context_cnt = utils.get_mesh_shape_product(self.runner.mesh,
+                                                   ShardingAxisName.CONTEXT)
         block_sizes = [
-            kv_cache_group.kv_cache_spec.block_size
+            kv_cache_group.kv_cache_spec.block_size * context_cnt
             for kv_cache_group in kv_cache_config.kv_cache_groups
         ]
         if block_sizes != [self.runner.cache_config.block_size]:

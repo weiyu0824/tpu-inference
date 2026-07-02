@@ -104,6 +104,8 @@ def main(args: dict):
         "Who wrote the American Declaration of Independence?",
         'Who wrote the novel "Pride and Prejudice"?',
     ]
+    base = "You are a very smart person, I would like to ask you some very tricky question to understand how smart your are. Here comes the questions. "
+    prompts = [base + prompt for prompt in prompts]
 
     profiler_config = llm.llm_engine.vllm_config.profiler_config
     if profiler_config.profiler == "torch":
