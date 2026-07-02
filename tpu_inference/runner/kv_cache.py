@@ -53,10 +53,21 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
                                  actual_head_dim: int,
                                  kv_dtype: any,
                                  use_mla: bool = False):
-    """Gets the KV cache shape based on the mesh configuration."""
+    """Gets the KV cache shape based on the mesh configuration.
+
+    block_size should be the logical (raw) per-rank value. This function
+    scales it by the CONTEXT (DCP) axis size to produce the correct global
+    physical shape, mirroring how heads are scaled by KV_CACHE_HEAD.
+    """
 
     model_cnt = utils.get_mesh_shape_product(mesh,
                                              ShardingAxisName.KV_CACHE_HEAD)
+    # DCP shards the sequence (block_size) dimension via the CONTEXT axis.
+    # Multiply block_size by the DCP factor so the global array shape
+    # reflects the full physical token capacity per page. Each DCP rank then
+    # holds block_size tokens locally after JAX sharding.
+    context_cnt = utils.get_mesh_shape_product(mesh, ShardingAxisName.CONTEXT)
+    physical_block_size = block_size * context_cnt
 
     # NOTE(chengjiyao): Currently, the attention kernel is tailored to the
     # specific model, rather than being determined by the head_dim. If new
@@ -67,8 +78,8 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
         # so actual_num_kv_heads is never used in mla.get_kv_cache_shape().
         get_kv_cache_shape_fn = mla.get_kv_cache_shape
         shape = list(
-            get_kv_cache_shape_fn(total_num_pages, block_size, actual_head_dim,
-                                  kv_dtype))
+            get_kv_cache_shape_fn(total_num_pages, physical_block_size,
+                                  actual_head_dim, kv_dtype))
     else:
         assert actual_num_kv_heads % model_cnt == 0
         get_kv_cache_shape_fn = (
@@ -76,7 +87,7 @@ def get_kv_cache_shape_with_mesh(mesh: Mesh,
                 else rpa.get_kv_cache_shape
         )
         shape = list(
-            get_kv_cache_shape_fn(total_num_pages, block_size,
+            get_kv_cache_shape_fn(total_num_pages, physical_block_size,
                                   actual_num_kv_heads // model_cnt,
                                   actual_head_dim, kv_dtype))
         shape[2] *= model_cnt
