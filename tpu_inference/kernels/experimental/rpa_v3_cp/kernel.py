@@ -73,11 +73,14 @@ def ref_ragged_paged_attention(
     Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     kv_cache: jax.
     Array,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
+    kv_cache_lens: jax.Array,  # i32[max_num_seqs] – prior KV-cache token counts
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     *,
+    cu_kv_lens: jax.Array | None = None,  # i32[max_num_seqs + 1]
+    q_start: jax.Array | None = None,  # i32[max_num_seqs]
+    kv_start: jax.Array | None = None,  # i32[max_num_seqs]
     cp_rank: jax.Array | int | None = None,
     cp_group_size: int | None = None,
     use_causal_mask: bool = True,
@@ -99,15 +102,18 @@ def ref_ragged_paged_attention(
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
         mask_value = jnp.finfo(out_dtype).min
+    _cu_kv_lens_ref = cu_kv_lens if cu_kv_lens is not None else cu_q_lens
+    _cu_kv_lens_ref = cu_kv_lens if cu_kv_lens is not None else cu_q_lens
     dynamic_validate_inputs(
         queries,
         keys,
         values,
         kv_cache,
-        kv_lens,
+        kv_cache_lens,
         page_indices,
         cu_q_lens,
         distribution,
+        cu_kv_lens=_cu_kv_lens_ref,
         cp_rank=cp_rank,
         cp_group_size=cp_group_size,
         use_causal_mask=use_causal_mask,
@@ -136,30 +142,33 @@ def ref_ragged_paged_attention(
     assert get_dtype_packing(kv_cache.dtype) == kv_packing
     assert num_kv_heads_x2 == align_to(actual_num_kv_heads * 2, kv_packing)
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
-    max_num_seqs = kv_lens.shape[0]
+    max_num_seqs = kv_cache_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
     outputs = []
 
     for i in range(distribution[-1]):
-        q_start = cu_q_lens[i]
-        q_end = cu_q_lens[i + 1]
-        q_len = q_end - q_start
+        q_start_i = cu_q_lens[i]
+        q_end_i = cu_q_lens[i + 1]
+        q_len = q_end_i - q_start_i
 
-        kv_len = kv_lens[i]
+        kv_new_len_i = int(_cu_kv_lens_ref[i + 1] - _cu_kv_lens_ref[i])
+        kv_cache_len_i = int(kv_cache_lens[i])
+        kv_len = kv_cache_len_i + kv_new_len_i
         indices_start = i * pages_per_seq
         indices_end = indices_start + cdiv(kv_len, page_size)
         indices = page_indices[indices_start:indices_end]
-        q = queries[q_start:q_end, :, :actual_head_dim]
+        q = queries[q_start_i:q_end_i, :, :actual_head_dim]
 
-        # Update the kv cache.
-        assert kv_len - q_len >= 0
+        # Update the kv cache with the new KV tokens.
         gathered_kv = kv_cache[indices]
         gathered_shape = gathered_kv.shape
         gathered_kv = gathered_kv.reshape(-1, *gathered_shape[-3:])
-        gathered_kv = gathered_kv.at[kv_len - q_len:kv_len].set(
-            merged_kv[q_start:q_end])
+        kv_hbm_start = int(_cu_kv_lens_ref[i])
+        kv_hbm_end = int(_cu_kv_lens_ref[i + 1])
+        gathered_kv = gathered_kv.at[kv_cache_len_i:kv_len].set(
+            merged_kv[kv_hbm_start:kv_hbm_end])
         kv_cache = kv_cache.at[indices].set(
             gathered_kv.reshape(gathered_shape))
 
@@ -193,8 +202,9 @@ def ref_ragged_paged_attention(
         if soft_cap is not None:
             attn = soft_cap * jnp.tanh(attn / soft_cap)
 
+        q_start_global = int(kv_cache_lens[i]) if q_start is None else int(q_start[i])
         if use_causal_mask:
-            q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(
+            q_span = q_start_global + jax.lax.broadcasted_iota(
                 jnp.int32, attn.shape, 1)
             kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
             mask = q_span >= kv_span
@@ -202,8 +212,7 @@ def ref_ragged_paged_attention(
                 mask = jnp.logical_and(mask, q_span < kv_span + sliding_window)
             attn = jnp.where(mask, attn, mask_value)
 
-        kv_new_len_i = int(q_len)
-        kv_new_start_i = int(kv_len) - kv_new_len_i
+        kv_new_start_i = kv_cache_len_i
         sa_kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
         if skip_cache_attn:
             attn = jnp.where(sa_kv_span >= kv_new_start_i, attn, mask_value)
@@ -293,7 +302,10 @@ def get_kv_cache_shape(
 
 
 def _ragged_paged_attention_kernel(*args, **kwargs):
-    distribution_ref = args[3]
+    # scalar_prefetches order:
+    #   kv_cache_lens[0], page_indices[1], cu_q_lens[2], cu_kv_lens[3],
+    #   q_start[4], kv_start[5], distribution[6], ...
+    distribution_ref = args[6]
     start_seq_idx, end_seq_idx = kwargs["case"].get_range(distribution_ref)
 
     @pl.loop(start_seq_idx, end_seq_idx)
@@ -308,9 +320,12 @@ def _ragged_paged_attention_kernel(*args, **kwargs):
 def _ragged_paged_attention_kernel_loop(
     seq_idx,
     # Prefetch
-    kv_lens_ref,  # [max_num_seqs]
+    kv_cache_lens_ref,  # [max_num_seqs] – prior KV-cache token counts (explicit)
     page_indices_ref,  # [max_num_seqs * pages_per_seq]
-    cu_q_lens_ref,  # [max_num_seqs + 1]
+    cu_q_lens_ref,  # [max_num_seqs + 1] – cumulative Q lengths in local Q buffer
+    cu_kv_lens_ref,  # [max_num_seqs + 1] – cumulative new-KV lengths in kv_hbm_ref
+    q_start_ref,  # [max_num_seqs] – global KV-seq position of first Q token (causal mask)
+    kv_start_ref,  # [max_num_seqs] – global KV-seq position of first new-KV token
     # TODO(jevinjiang): merge these into one so we can save SMEM.
     distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
@@ -391,7 +406,7 @@ def _ragged_paged_attention_kernel_loop(
         num_kv_heads_x2_per_kv_packing,
         num_kv_heads_x2_per_kv_packing + 1,
     )
-    max_num_seqs = kv_lens_ref.shape[0]
+    max_num_seqs = kv_cache_lens_ref.shape[0]
     num_page_indices = page_indices_ref.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
@@ -412,17 +427,23 @@ def _ragged_paged_attention_kernel_loop(
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
 
+    # New KV token count from cu_kv_lens span in kv_hbm_ref.
+    # For non-CP / DCP decode: equals q_len (cu_kv_lens == cu_q_lens by default).
+    # For PCP prefill: full gathered sequence length (all L tokens after all-gather).
+    kv_new_len = cu_kv_lens_ref[seq_idx + 1] - cu_kv_lens_ref[seq_idx]
+
+    # Global KV-sequence position of the first Q token on this device.
+    # Provided explicitly so the kernel stays agnostic to how CP split was done.
+    # Default (set by caller): kv_cache_lens[i] — no CP offset.
+    # For PCP rank k: kv_cache_lens[i] + k * (global_q_len // N).
+    kv_q_gap = q_start_ref[seq_idx]
+
     # Helper functions for context parallelism.
     def get_cp_local_size(x):
         return (x + cp_group_size - 1 - cp_rank) // cp_group_size
 
-    def get_kv_cache_len_local(seq_idx):
-        global_len = kv_lens_ref[seq_idx] - (cu_q_lens_ref[seq_idx + 1] -
-                                             cu_q_lens_ref[seq_idx])
-        return get_cp_local_size(global_len)
-
     def get_start_bkv_idx(seq_idx):
-        local_cache_len = get_kv_cache_len_local(seq_idx)
+        local_cache_len = get_cp_local_size(kv_cache_lens_ref[seq_idx])
         start_idx = 0
         if sliding_window is not None:
             start_idx = jnp.maximum(local_cache_len - sliding_window,
@@ -433,39 +454,23 @@ def _ragged_paged_attention_kernel_loop(
 
     if cp_group_size is not None:
         cp_rank = cp_rank_ref[0]
-        # Get cache length and new token length.
-        kv_new_len = q_len
-
-        # Convert global kv_cache_len to per-device local values.
-        kv_cache_len_local = get_kv_cache_len_local(seq_idx)
-
-        # Local kv_len = partial cache + full KV
-        kv_len = kv_cache_len_local + kv_new_len
-
-        # kv_q_gap is used to calculate processed_q_len.
-        kv_q_gap = kv_cache_len_local
-
+        kv_cache_len_local = get_cp_local_size(kv_cache_lens_ref[seq_idx])
         cur_seq_start_bkv_idx = get_start_bkv_idx(seq_idx)
         next_seq_idx = jnp.minimum(seq_idx + 1, end_seq_idx - 1)
         next_seq_start_bkv_idx = get_start_bkv_idx(next_seq_idx)
     else:
-        kv_len = kv_lens_ref[seq_idx]
-        kv_q_gap = kv_len - q_len
+        kv_cache_len_local = kv_cache_lens_ref[seq_idx]
         cur_seq_start_bkv_idx = 0
         next_seq_start_bkv_idx = 0
         if sliding_window is not None:
-            # TODO(jevinjiang): can skip by page_size instead of bkv_sz.
             cur_seq_start_bkv_idx = (
                 jnp.maximum(kv_q_gap - sliding_window, 0) // bkv_sz)
             next_seq_idx = jnp.minimum(seq_idx + 1, end_seq_idx - 1)
-            next_q_start = cu_q_lens_ref[next_seq_idx]
-            next_q_end = cu_q_lens_ref[next_seq_idx + 1]
-            next_q_len = next_q_end - next_q_start
-            next_kv_len = kv_lens_ref[next_seq_idx]
-            next_kv_q_gap = next_kv_len - next_q_len
+            next_kv_q_gap = q_start_ref[next_seq_idx]
             next_seq_start_bkv_idx = (
                 jnp.maximum(next_kv_q_gap - sliding_window, 0) // bkv_sz)
-        kv_cache_len_local = kv_len - q_len
+
+    kv_len = kv_cache_len_local + kv_new_len
 
     def debug_print(msg, *args):
         if debug_mode:
@@ -639,30 +644,28 @@ def _ragged_paged_attention_kernel_loop(
         cache_hbm_ref = kv_cache_hbm_ref.reshape(
             cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:])
 
-        _seq_q_start = cu_q_lens_ref[seq_idx]
-        _seq_q_end = cu_q_lens_ref[seq_idx + 1]
-        _seq_q_len = _seq_q_end - _seq_q_start
-        _seq_total_kv_len = kv_lens_ref[seq_idx]
+        # New-KV range inside kv_hbm_ref for this sequence.
+        # For non-CP / DCP decode: same as Q (cu_kv_lens == cu_q_lens by default).
+        # For PCP prefill: spans the full all-gathered KV (cu_kv_lens has L tokens).
+        _seq_kv_start = cu_kv_lens_ref[seq_idx]
+        _seq_kv_end = cu_kv_lens_ref[seq_idx + 1]
+        _seq_kv_new_len = _seq_kv_end - _seq_kv_start
 
         if cp_group_size is None:
-            _seq_kv_len_local = _seq_total_kv_len
-
+            _seq_kv_len_local = kv_cache_lens_ref[seq_idx] + _seq_kv_new_len
         else:
-            _seq_kv_cache_len_local = get_kv_cache_len_local(seq_idx)
-            _seq_kv_len_local = _seq_kv_cache_len_local + _seq_q_len
+            _seq_kv_cache_len_local = get_cp_local_size(kv_cache_lens_ref[seq_idx])
+            _seq_kv_len_local = _seq_kv_cache_len_local + _seq_kv_new_len
 
         kv_len_start = bkv_idx * bkv_sz
         kv_p_start = bkv_idx * bkv_p
         kv_left = _seq_kv_len_local - kv_len_start
         if update_kv_cache:
-            kv_left_frm_cache = jnp.maximum(kv_left - _seq_q_len, 0)
+            kv_left_frm_cache = jnp.maximum(kv_left - _seq_kv_new_len, 0)
         else:
             # KV-share: source layer already wrote the full K/V for the
             # current step into the (redirected) cache slot before this
-            # layer's call, so read everything from cache. The shared
-            # layer's input k,v is unused. Mirrors vllm-pytorch behavior
-            # where unified_attention reads from key_cache/value_cache
-            # only, regardless of the layer's own k,v projections.
+            # layer's call, so read everything from cache.
             kv_left_frm_cache = kv_left
         kv_left_frm_new = kv_left - kv_left_frm_cache
 
@@ -691,15 +694,11 @@ def _ragged_paged_attention_kernel_loop(
             if update_kv_cache:
                 wait_update_kv_cache(bkv_sem_idx)
 
-            # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
-            # utilize static for loop instead of dynamic for loop.
+            # Fetch effective kv from kv cache.
             if not skip_cache_attn:
                 for i in range(bkv_p):
-                    # Ensure only effective kvs are copied.
                     sz = jnp.clip(kv_left_frm_cache - i * page_size, 0,
                                   page_size)
-                    # If the page index is out of bound, we set page_idx to the last page.
-                    # And there will be no copy since sz will be 0.
                     page_idx = jnp.minimum(page_indices_offset + i,
                                            num_page_indices - 1)
                     _async_copy(
@@ -710,9 +709,9 @@ def _ragged_paged_attention_kernel_loop(
                         wait=False,
                     )
                     debug_print("[RPA debug] loop_body i={}, sz={}", i, sz)
-            # Fetch new kvs.
+            # Fetch new KVs from kv_hbm_ref using cu_kv_lens indexing.
             if not skip_current_attn:
-                new_kv_len_start = _seq_q_end - kv_left_frm_new
+                new_kv_len_start = _seq_kv_end - kv_left_frm_new
                 debug_print("[RPA debug] new_kv_len_start={}",
                             new_kv_len_start)
                 _async_copy(
@@ -734,14 +733,15 @@ def _ragged_paged_attention_kernel_loop(
                 sem=sem,
                 wait=True,
             )
-        if cp_group_size is not None:
-            # NOTE(weiyulin): for CP, offset is global_idx of the first new kv token in this
-            # bkv buffer, offset only matter when bkv_sz_frm_new > 0
-            new_kv_len_start = _seq_q_len - kv_left_frm_new
-            offset = new_kv_len_start + (_seq_total_kv_len - _seq_q_len)
-            return offset, bkv_sz_frm_new, bkv_sz_frm_cache,
-        else:
-            return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new, None
+
+        # Unified offset for cache write: global position of the first new token
+        # in this bkv buffer.  kv_start is the global KV position where new tokens
+        # begin (== kv_cache_lens by default; may differ for future prefix-cache use).
+        new_kv_consumed = _seq_kv_new_len - kv_left_frm_new
+        offset = kv_start_ref[seq_idx] + new_kv_consumed
+        # bkv_sz_frm_cache doubles as src_start_base for _update_kv_cache_partial
+        # (the vmem offset where new-KV tokens start in the bkv double-buffer).
+        return offset, bkv_sz_frm_new, bkv_sz_frm_cache
 
     def _update_kv_cache_full(seq_idx,
                               bkv_sem_idx,
@@ -983,11 +983,8 @@ def _ragged_paged_attention_kernel_loop(
         def _():
             _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
-    def start_update_kv_cache(seq_idx,
-                              bkv_sem_idx,
-                              offset,
-                              update_sz,
-                              src_start_base=None):
+    def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz,
+                              src_start_base):
         bkv_update_ids_ref[bkv_sem_idx] = seq_idx
         bkv_update_ids_ref[bkv_sem_idx + 2] = offset
         bkv_update_ids_ref[bkv_sem_idx + 4] = update_sz
@@ -1510,11 +1507,12 @@ def dynamic_validate_inputs(
     Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     kv_cache: jax.
     Array,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
+    kv_cache_lens: jax.Array,  # i32[max_num_seqs] – prior KV-cache token counts
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     *,
+    cu_kv_lens: jax.Array | None = None,  # i32[max_num_seqs + 1]
     cp_rank: jax.Array | int | None = None,
     cp_group_size: int | None = None,
     use_causal_mask: bool = True,
@@ -1541,7 +1539,7 @@ def dynamic_validate_inputs(
         k,
         v,
         kv_cache,
-        kv_lens,
+        kv_cache_lens,
         page_indices,
         cu_q_lens,
         distribution,
@@ -1565,7 +1563,7 @@ def dynamic_validate_inputs(
     max_num_tokens = q.shape[0]
     total_num_pages = kv_cache.shape[0]
     page_size = kv_cache.shape[1]
-    max_num_seqs = kv_lens.shape[0]
+    max_num_seqs = kv_cache_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
@@ -1580,23 +1578,16 @@ def dynamic_validate_inputs(
     if cu_q_lens[k] > max_num_tokens:
         raise ValueError(
             f"Total q tokens {cu_q_lens[k]} must be <= {max_num_tokens=}.")
+    _cu_kv = cu_kv_lens if cu_kv_lens is not None else cu_q_lens
     for i in range(k):
         q_len = cu_q_lens[i + 1] - cu_q_lens[i]
-        kv_len = kv_lens[i]
-        if not (0 < q_len <= kv_len):
+        if not (0 < q_len):
+            raise ValueError(f"Require 0 < {q_len=} at sequence {i}.")
+        kv_cache_len = kv_cache_lens[i]
+        if kv_cache_len < 0:
             raise ValueError(
-                f"Require 0 < {q_len=} <= {kv_len=} at sequence {i}.")
-        page_cnt = cdiv(kv_len, page_size)
-        if page_cnt > pages_per_seq:
-            raise ValueError(
-                f"Require {page_cnt=} <= {pages_per_seq=} at sequence {i} where"
-                f" {kv_len=} and {page_size=}.")
-        for p in range(page_cnt):
-            page_idx = page_indices[i * pages_per_seq + p]
-            if not (0 <= page_idx < total_num_pages):
-                raise ValueError(
-                    f"Require 0 <= {page_idx=} < {total_num_pages=} at sequence"
-                    f" {i} where {kv_len=} and {page_size=}.")
+                f"Require {kv_cache_len=} >= 0 at sequence {i}.")
+        kv_new_len = _cu_kv[i + 1] - _cu_kv[i]
         if cp_group_size is not None:
             if cp_rank is None:
                 raise ValueError(
@@ -1604,6 +1595,22 @@ def dynamic_validate_inputs(
             if not (0 <= cp_rank[0] < cp_group_size):
                 raise ValueError(
                     f"Require 0 <= {cp_rank=} < {cp_group_size=}.")
+            # For DCP: kv_cache_lens is global; the kernel holds only the
+            # local round-robin share of the cache.
+            local_kv_cache_len = (int(kv_cache_len) + cp_group_size - 1 -
+                                  int(cp_rank[0])) // cp_group_size
+            page_cnt = cdiv(local_kv_cache_len + int(kv_new_len), page_size)
+        else:
+            page_cnt = cdiv(int(kv_cache_len) + int(kv_new_len), page_size)
+        if page_cnt > pages_per_seq:
+            raise ValueError(
+                f"Require {page_cnt=} <= {pages_per_seq=} at sequence {i}.")
+        for p in range(page_cnt):
+            page_idx = page_indices[i * pages_per_seq + p]
+            if not (0 <= page_idx < total_num_pages):
+                raise ValueError(
+                    f"Require 0 <= {page_idx=} < {total_num_pages=} at"
+                    f" sequence {i}.")
 
 
 # Expect to run this validation during compile time.
@@ -1615,7 +1622,7 @@ def static_validate_inputs(
     Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     kv_cache: jax.
     Array,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
+    kv_cache_lens: jax.Array,  # i32[max_num_seqs] – prior KV-cache token counts
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
@@ -1717,19 +1724,20 @@ def static_validate_inputs(
             f"Invalid {num_kv_heads_x2=}, {actual_num_kv_heads=}, {kv_packing=}"
         )
 
-    if not (jnp.int32 == kv_lens.dtype == page_indices.dtype == cu_q_lens.dtype
-            == distribution.dtype):
+    if not (jnp.int32 == kv_cache_lens.dtype == page_indices.dtype ==
+            cu_q_lens.dtype == distribution.dtype):
         raise ValueError(
-            f"Expected int32 dtype for {kv_lens.dtype=}, {page_indices.dtype=},"
-            f" {cu_q_lens.dtype=}, {distribution.dtype=}")
+            f"Expected int32 dtype for {kv_cache_lens.dtype=},"
+            f" {page_indices.dtype=}, {cu_q_lens.dtype=}, {distribution.dtype=}"
+        )
 
-    if not (len(kv_lens.shape) == len(page_indices.shape) == len(
+    if not (len(kv_cache_lens.shape) == len(page_indices.shape) == len(
             cu_q_lens.shape) == 1):
         raise ValueError(
-            f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=},"
-            f" {cu_q_lens.shape=}")
+            f"Expected 1D array for {kv_cache_lens.shape=},"
+            f" {page_indices.shape=}, {cu_q_lens.shape=}")
 
-    max_num_seqs = kv_lens.shape[0]
+    max_num_seqs = kv_cache_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     if num_page_indices % max_num_seqs != 0:
         raise ValueError(
@@ -1904,11 +1912,17 @@ def ragged_paged_attention(
     Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
     kv_cache: jax.
     Array,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
-    kv_lens: jax.Array,  # i32[max_num_seqs]
+    kv_cache_lens: jax.Array,  # i32[max_num_seqs] – prior KV-cache token counts (explicit)
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
-    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1] – cumulative Q lengths in local Q buffer
     distribution: jax.Array,  # i32[3]
     *,
+    cu_kv_lens: jax.Array
+    | None = None,  # i32[max_num_seqs + 1] – cumulative new-KV lengths in kv_hbm_ref
+    q_start: jax.Array
+    | None = None,  # i32[max_num_seqs] – global KV-seq start of local Q (causal mask)
+    kv_start: jax.Array
+    | None = None,  # i32[max_num_seqs] – global KV-seq start of new-KV in kv_hbm_ref
     cp_rank: jax.Array
     | None = None,  # i32[1] - per-device rank, sharded along the DCP axis
     cp_group_size: int | None = None,
@@ -1950,10 +1964,11 @@ def ragged_paged_attention(
     keys: concatenated all sequences' keys (quantized).
     values: concatenated all sequences' values (quantized).
     kv_cache: paged KV cache with TPU-friendly shape.
-    kv_lens: padded kv lengths. Only the first num_seqs values are valid.
+    kv_cache_lens: prior KV-cache token counts per sequence (explicit; excludes
+      new tokens in kv_hbm_ref). Only the first num_seqs values are valid.
     page_indices: flattened page indices look-up table by (seq_id, page_id).
-    cu_q_lens: the cumulative sum of the effective query lengths. Similar to
-      kv_lens, only the first num_seqs+1 values are valid.
+    cu_q_lens: the cumulative sum of the effective query lengths. Only the first
+      num_seqs+1 values are valid.
     distribution: (i, j, k) represents that sequences[0:i] are decode-only,
       sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
       k is also the total number of sequences.
@@ -2006,7 +2021,7 @@ def ragged_paged_attention(
         k,
         v,
         kv_cache,
-        kv_lens,
+        kv_cache_lens,
         page_indices,
         cu_q_lens,
         distribution,
@@ -2028,6 +2043,14 @@ def ragged_paged_attention(
         vmem_limit_bytes=vmem_limit_bytes,
     )
 
+    # Resolve optional metadata parameters.
+    # cu_kv_lens: defaults to cu_q_lens (non-CP case where Q and new-KV share positions).
+    # q_start:    defaults to kv_cache_lens (Q starts right after the cache).
+    # kv_start:   defaults to kv_cache_lens (new-KV starts right after the cache).
+    _cu_kv_lens = cu_kv_lens if cu_kv_lens is not None else cu_q_lens
+    _q_start = q_start if q_start is not None else kv_cache_lens
+    _kv_start = kv_start if kv_start is not None else kv_cache_lens
+
     actual_num_q_heads = q.shape[1]
     actual_head_dim = q.shape[2]
     actual_num_kv_heads = k.shape[1]
@@ -2043,7 +2066,7 @@ def ragged_paged_attention(
     ) = q.shape
     page_size = kv_cache.shape[1]
     num_kv_heads_x2_per_kv_packing = kv_cache.shape[2]
-    max_num_seqs = kv_lens.shape[0]
+    max_num_seqs = kv_cache_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
@@ -2144,10 +2167,15 @@ def ragged_paged_attention(
         ]
 
         scalar_prefetches = (
-            kv_lens,
+            kv_cache_lens,
             # TODO(jevinjiang): can we use ragged page_indices to save some smem?
             page_indices,
             cu_q_lens,
+            # cu_kv_lens, q_start, kv_start are always passed (defaulting to
+            # cu_q_lens / kv_cache_lens when not provided by the caller).
+            _cu_kv_lens,
+            _q_start,
+            _kv_start,
             distribution,
             init_sem_ids,
             init_bo_ids,

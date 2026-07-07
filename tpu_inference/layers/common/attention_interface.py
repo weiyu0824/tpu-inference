@@ -55,6 +55,9 @@ else:
     import tpu_inference.kernels.ragged_paged_attention.v3.kernel as rpa
     logger.info_once("Using default RPA kernel")
 
+from tpu_inference.kernels.experimental.rpa_v3_cp.kernel import \
+    ragged_paged_attention as cp_ragged_paged_attention
+
 ragged_paged_attention = rpa.ragged_paged_attention
 get_kv_cache_shape = rpa.get_kv_cache_shape
 
@@ -461,6 +464,105 @@ def sharded_ragged_paged_attention(
     )(*args)
 
 
+def pcp_sharded_ragged_paged_attention(
+    mesh: Mesh,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    kv_cache: jax.Array,
+    kv_cache_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    cu_kv_lens: jax.Array,
+    sm_scale: float,
+    cp_axis_name: str = 'dcp',
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+) -> Tuple[jax.Array, jax.Array]:
+    """PCP prefill attention: shard Q/K/V tokens over dcp, all-gather K/V inside.
+
+    Each PCP device processes L/N Q tokens.  K/V are all-gathered from the
+    L/N-token local slices to reconstruct the full L-token sequence before the
+    CP-aware RPA kernel runs.  The KV cache is passed as-is (sharded by DCP
+    in the token/block_size dimension) so each device writes its own tokens.
+
+    Args:
+        cu_kv_lens: Global cumulative new-KV lengths (after all-gather) — one
+            entry per sequence.  Set only for PCP prefill.
+    """
+    # Head TP for PCP: model + expert axes only ('dcp' is used for token split).
+    head_tp_size = get_mesh_shape_product(mesh, ShardingAxisName.KV_CACHE_HEAD)
+    if head_tp_size > 1:
+        num_kv_heads = k.shape[1]
+        if num_kv_heads < head_tp_size:
+            if head_tp_size % num_kv_heads != 0:
+                raise ValueError(
+                    f"For GQA/MQA (PCP), head_tp_size {head_tp_size} must be "
+                    f"divisible by num_kv_heads {num_kv_heads}")
+            factor = head_tp_size // num_kv_heads
+            k = jnp.repeat(k, factor, axis=1)
+            v = jnp.repeat(v, factor, axis=1)
+
+    cp_group_size = mesh.shape[cp_axis_name]
+
+    # Token dim: sharded over ATTN_DATA + 'dcp'; head dim: model + expert only.
+    pcp_tok_spec = P(ShardingAxisName.ATTN_DATA + (cp_axis_name,),
+                     ShardingAxisName.KV_CACHE_HEAD, None)
+    # KV cache: pages over ATTN_DATA; 'dcp' absent (consumed by token dim).
+    kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None,
+                      ShardingAxisName.KV_CACHE_HEAD, None, None)
+    meta_spec = P(ShardingAxisName.ATTN_DATA)
+
+    in_specs = (
+        pcp_tok_spec,  # q
+        pcp_tok_spec,  # k
+        pcp_tok_spec,  # v
+        kv_cache_spec,
+        meta_spec,     # kv_cache_lens
+        meta_spec,     # page_indices
+        meta_spec,     # cu_q_lens
+        meta_spec,     # distribution
+        meta_spec,     # cu_kv_lens
+    )
+    out_specs = (pcp_tok_spec, kv_cache_spec)
+
+    def _pcp_ragged_paged_attention(q, k, v, kv_cache, kv_cache_lens,
+                                    page_indices, cu_q_lens, distribution,
+                                    cu_kv_lens):
+        # All-gather K and V across the PCP group to reconstruct full L tokens.
+        k_full = jax.lax.all_gather(k, axis_name=cp_axis_name, axis=0,
+                                    tiled=True)
+        v_full = jax.lax.all_gather(v, axis_name=cp_axis_name, axis=0,
+                                    tiled=True)
+        cp_rank = jax.lax.axis_index(cp_axis_name)
+        q_lens_global = cu_kv_lens[1:] - cu_kv_lens[:-1]
+        local_q_starts = cp_rank * (q_lens_global // cp_group_size)
+        q_start = (kv_cache_lens + local_q_starts).astype(jnp.int32)
+        return cp_ragged_paged_attention(
+            q, k_full, v_full, kv_cache, kv_cache_lens, page_indices,
+            cu_q_lens, distribution,
+            cu_kv_lens=cu_kv_lens,
+            q_start=q_start,
+            cp_rank=jnp.array([cp_rank], dtype=jnp.int32),
+            cp_group_size=cp_group_size,
+            sm_scale=sm_scale,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+    return jax.shard_map(
+        _pcp_ragged_paged_attention,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )(q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution,
+      cu_kv_lens)
+
+
 def attention(
     kv_cache: jax.Array,
     q: jax.Array,
@@ -496,6 +598,20 @@ def attention(
         sm_scale = head_dim_original**-0.5
 
     md = attention_metadata
+
+    if md.cu_kv_lens is not None:
+        # PCP prefill: each device holds L/N Q tokens; K/V are all-gathered
+        # inside pcp_sharded_ragged_paged_attention to reconstruct L tokens.
+        output, kv_cache = pcp_sharded_ragged_paged_attention(
+            mesh, q, k, v, kv_cache,
+            md.seq_lens, md.block_tables, md.query_start_loc,
+            md.request_distribution, md.cu_kv_lens,
+            sm_scale=sm_scale,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        return kv_cache, output
 
     # (T, N, H)
     output, kv_cache = sharded_ragged_paged_attention(

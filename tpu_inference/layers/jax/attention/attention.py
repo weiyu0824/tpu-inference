@@ -26,6 +26,8 @@ from jax.sharding import PartitionSpec as P
 from tpu_inference import utils
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import \
     ragged_paged_attention
+from tpu_inference.layers.common.attention_interface import \
+    pcp_sharded_ragged_paged_attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -227,18 +229,32 @@ class Attention(nnx.Module):
         """
         md = attention_metadata
         kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None, "model")
-        in_specs = (
-            self.query_tnh,  # q
-            self.keyvalue_skh,  # k
-            self.keyvalue_skh,  # v
-            kv_cache_spec,  # kv_cache
-            P(ShardingAxisName.ATTN_DATA),  # md.seq_lens
-            P(ShardingAxisName.ATTN_DATA),  # page_indices_flat
-            P(ShardingAxisName.ATTN_DATA),  # query_start_loc
-            P(ShardingAxisName.ATTN_DATA),  # distribution
-        )
+
+        if md.cu_kv_lens is not None:
+            q_lens_global = md.cu_kv_lens[1:] - md.cu_kv_lens[:-1]
+            kv_cache_lens = (md.seq_lens - q_lens_global).astype(jnp.int32)
+            output_TNH, kv_cache = pcp_sharded_ragged_paged_attention(
+                mesh, q_TNH, k_SKH, v_SKH, kv_cache,
+                kv_cache_lens, md.block_tables, md.query_start_loc,
+                md.request_distribution, md.cu_kv_lens,
+                sm_scale=q_TNH.shape[-1]**-0.5,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            return kv_cache, output_TNH
 
         out_specs = (self.attn_o_tnh, kv_cache_spec)
+        in_specs = (
+            self.query_tnh,                         # q
+            self.keyvalue_skh,                      # k
+            self.keyvalue_skh,                      # v
+            kv_cache_spec,                          # kv_cache
+            P(ShardingAxisName.ATTN_DATA),          # md.seq_lens
+            P(ShardingAxisName.ATTN_DATA),          # page_indices_flat
+            P(ShardingAxisName.ATTN_DATA),          # query_start_loc
+            P(ShardingAxisName.ATTN_DATA),          # distribution
+        )
 
         def _ragged_paged_attention(*args):
             return ragged_paged_attention(

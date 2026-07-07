@@ -25,6 +25,7 @@ import jax
         "block_tables",
         "seq_lens",
         "query_start_loc",
+        "cu_kv_lens",
         "request_distribution",
         "mamba_state_indices",
     ],
@@ -39,8 +40,15 @@ class AttentionMetadata(object):
     block_tables: jax.Array | None = None
     # (max_num_seqs,)
     seq_lens: jax.Array = None
-    # (max_num_seqs + 1,)
+    # (max_num_seqs + 1,) — cumulative local-Q lengths in the Q buffer on this device.
+    # For non-PCP this equals the global cumulative Q lengths.
+    # For PCP prefill this holds the per-device Q slice offsets (local cu_q_lens).
     query_start_loc: jax.Array = None
+    # (max_num_seqs + 1,) — cumulative new-KV lengths in kv_hbm_ref.
+    # None means the same as query_start_loc (non-PCP case).
+    # For PCP prefill: holds the GLOBAL cumulative Q lengths (all L tokens), which
+    # equals the kv_hbm_ref positions after K/V are all-gathered across the PCP group.
+    cu_kv_lens: jax.Array | None = None
     # (3,)
     request_distribution: jax.Array = None
     # (max_num_seqs,) int32 — physical slot id (∈ [0, _mamba_num_blocks))
