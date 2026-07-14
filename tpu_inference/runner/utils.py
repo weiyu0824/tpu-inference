@@ -849,9 +849,11 @@ class PhasedBasedProfiler:
         """
 
         have_seen_all_phases = all(self.inference_phase_seen.values())
-        # We want to start profiling only after the first trial request
-        is_past_initial_request = batch_composition_stats[
-            "total_num_scheduled_tokens"] > 1
+        # We want to start profiling only after the first trial request.
+        # Use batch_id > 1 instead of total_num_scheduled_tokens > 1 so that
+        # single-request decode steps (1 token) are not incorrectly skipped.
+        is_past_initial_request = batch_composition_stats.get("batch_id",
+                                                              0) > 1
         if is_past_initial_request and (not have_seen_all_phases
                                         or self.current_phase != ""):
             # We haven't started profiling yet
