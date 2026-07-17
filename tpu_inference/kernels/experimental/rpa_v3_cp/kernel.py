@@ -363,6 +363,7 @@ def _ragged_paged_attention_kernel_loop(
     case: RpaCase = RpaCase.MIXED,
     debug_mode: bool = False,
     return_lse: bool = False,
+    skip_non_local_tokens: bool = False,
 ):
 
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -444,6 +445,12 @@ def _ragged_paged_attention_kernel_loop(
 
         # kv_q_gap is used to calculate processed_q_len.
         kv_q_gap = kv_cache_len_local
+
+        if skip_non_local_tokens:
+            # Global index of the first new (current) token for this sequence.
+            # kv_lens_ref[seq_idx] includes the current q_len tokens, so
+            # subtracting q_len gives the historical KV length.
+            global_kv_old = kv_lens_ref[seq_idx] - q_len
 
         cur_seq_start_bkv_idx = get_start_bkv_idx(seq_idx)
         next_seq_idx = jnp.minimum(seq_idx + 1, end_seq_idx - 1)
@@ -573,6 +580,23 @@ def _ragged_paged_attention_kernel_loop(
             kv_cache_len_local_int = kv_cache_len_local.astype(int_ty)
             mask = mask_and(mask, k_span < kv_cache_len_local_int)
             v = jnp.where(v_span < kv_cache_len_local_int, v,
+                          jnp.array(0.0, dtype=v.dtype))
+
+        if skip_non_local_tokens:
+            # For new (current) token slots in the BKV buffer (local index >=
+            # kv_cache_len_local), only include the ones whose global position
+            # is owned by this DCP device.  Cache slots are always included.
+            kv_cache_len_local_int = kv_cache_len_local.astype(int_ty)
+            cp_rank_int = cp_rank.astype(int_ty)
+            global_kv_old_int = global_kv_old.astype(int_ty)
+            is_new_k = k_span >= kv_cache_len_local_int
+            owned_k = ((global_kv_old_int + k_span - kv_cache_len_local_int) %
+                       cp_group_size) == cp_rank_int
+            mask = mask_and(mask, jnp.where(is_new_k, owned_k, True))
+            is_new_v = v_span >= kv_cache_len_local_int
+            owned_v = ((global_kv_old_int + v_span - kv_cache_len_local_int) %
+                       cp_group_size) == cp_rank_int
+            v = jnp.where(jnp.where(is_new_v, owned_v, True), v,
                           jnp.array(0.0, dtype=v.dtype))
 
         if mask is not None:
@@ -1893,6 +1917,7 @@ def get_default_block_sizes(
         "disable_semaphore_checks",
         "update_kv_cache",
         "cp_group_size",
+        "skip_non_local_tokens",
     ),
     donate_argnames="kv_cache",
 )
@@ -1942,6 +1967,7 @@ def ragged_paged_attention(
     debug_mode: bool = False,
     disable_bounds_checks: bool = True,
     disable_semaphore_checks: bool = True,
+    skip_non_local_tokens: bool = False,
 ):
     """Ragged paged attention that supports mixed prefill and decode.
 
@@ -2182,7 +2208,7 @@ def ragged_paged_attention(
         if return_lse:
             input_output_aliases[num_active_scalers + 3] = 2  # lse -> lse_out
 
-        scope_name = f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
+        scope_name = f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}_skip_cache={skip_cache_attn}_skip_curr={skip_current_attn}"
         if sliding_window is not None:
             scope_name += f"-sw_{sliding_window}"
         kernel = pl.pallas_call(
@@ -2209,6 +2235,7 @@ def ragged_paged_attention(
                 debug_mode=debug_mode,
                 update_kv_cache=update_kv_cache,
                 return_lse=return_lse,
+                skip_non_local_tokens=skip_non_local_tokens,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=num_scalers,
@@ -2258,6 +2285,16 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
+            if skip_cache_attn and case == RpaCase.DECODE:
+                # current phase: only 1 new token to process, no cache reads.
+                # Use page_size as bkv_sz to minimize bkv_double_buf VMEM
+                # allocation (16KB vs 16MB), which dominates kernel overhead.
+                return {
+                    "bq_sz": 1,
+                    "bkv_sz": page_size,
+                    "bq_csz": 1,
+                    "bkv_csz": page_size,
+                }
             return get_default_block_sizes(
                 q.dtype,
                 kv_cache.dtype,
@@ -2329,5 +2366,6 @@ def ragged_paged_attention(
                 0, 1)[:, :, :actual_num_q_heads_per_kv_head].reshape(
                     max_num_tokens, actual_num_q_heads))
         return attn_out, kv_cache, lse
+        # return attn_out, kv_cache, None
 
     return attn_out, kv_cache

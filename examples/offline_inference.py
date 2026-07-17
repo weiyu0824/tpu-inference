@@ -4,7 +4,8 @@
 import json
 import os
 
-from vllm import LLM, EngineArgs
+import numpy as np
+from vllm import LLM, EngineArgs, SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from tpu_inference.core import disagg_utils
@@ -27,6 +28,15 @@ def create_parser():
     sampling_group.add_argument("--top-p", type=float)
     sampling_group.add_argument("--top-k", type=int)
 
+    # dummy prompt params (mutually exclusive with chat template)
+    dummy_group = parser.add_argument_group("Dummy prompt parameters")
+    dummy_group.add_argument("--input-len", type=int, default=None,
+                             help="Number of input tokens for dummy prompts.")
+    dummy_group.add_argument("--output-len", type=int, default=None,
+                             help="Number of output tokens for dummy prompts.")
+    dummy_group.add_argument("--batch-size", type=int, default=1,
+                             help="Number of dummy prompts.")
+
     # chat params
     chat_group = parser.add_argument_group("Chat parameters")
     chat_group.add_argument("--use-chat-template", action="store_true")
@@ -47,6 +57,9 @@ def main(args: dict):
     top_k = args.pop("top_k")
     use_chat_template = args.pop("use_chat_template")
     chat_template_kwargs = args.pop('chat_template_kwargs')
+    input_len = args.pop("input_len")
+    output_len = args.pop("output_len")
+    batch_size = args.pop("batch_size")
     # Safeguard in case the user doesn't provide use_chat_template
     if chat_template_kwargs != {}:
         use_chat_template = True
@@ -109,7 +122,18 @@ def main(args: dict):
     if profiler_config.profiler == "torch":
         llm.start_profile()
 
-    if use_chat_template:
+    if input_len is not None:
+        if output_len is not None and max_tokens is None:
+            max_tokens = output_len
+        dummy_token_ids = np.random.randint(10000, size=(batch_size, input_len))
+        prompts = [{"prompt_token_ids": ids.tolist()} for ids in dummy_token_ids]
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            ignore_eos=True,
+            max_tokens=max_tokens or 1,
+        )
+        outputs = llm.generate(prompts, sampling_params)
+    elif use_chat_template:
         logger.info(
             f"Using LLM chat API for inference with extra chat kwargs: {chat_template_kwargs}"
         )

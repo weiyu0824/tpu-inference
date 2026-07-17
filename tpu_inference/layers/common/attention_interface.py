@@ -28,6 +28,7 @@ from jax.sharding import PartitionSpec as P
 from jax.sharding import Sharding
 
 import tpu_inference.kernels.experimental.rpa_v3_cp.kernel as rpa_v3_cp
+import tpu_inference.kernels.experimental.rpa_v3_cp.write_kv as _write_kv_pallas
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from tpu_inference import envs
 from tpu_inference.kernels.flash_attention.kernel import (
@@ -487,7 +488,8 @@ def sharded_ragged_paged_attention_experimental(
         skip_cache_attn: bool = False,
         skip_current_attn: bool = False,
         is_context_phase: bool = False,
-        use_causal_mask: bool = True):
+        use_causal_mask: bool = True,
+        skip_non_local_tokens: bool = False):
     # Determine the Pallas kernel block sizes.
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
     if tp_size > 1:
@@ -564,7 +566,8 @@ def sharded_ragged_paged_attention_experimental(
                       skip_cache_attn=skip_cache_attn,
                       skip_current_attn=skip_current_attn,
                       return_lse=return_lse,
-                      use_causal_mask=use_causal_mask)
+                      use_causal_mask=use_causal_mask,
+                      skip_non_local_tokens=skip_non_local_tokens)
         return rpa_v3_cp.ragged_paged_attention(*kernel_args, **kwargs)
 
     return jax.shard_map(
@@ -671,7 +674,73 @@ def merge_attn_states(context_out: jax.Array, context_lse: jax.Array,
     return merged_out, merged_lse
 
 
-def forward_with_dcp(
+def _jax_write_decode_kv(
+    mesh: Mesh,
+    k: jax.Array,
+    v: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+) -> jax.Array:
+    """Write one new decode token per sequence into the paged KV cache.
+
+    Vectorized scatter over padded sequences.  kv_lens / page_indices use
+    attn_padded_num_reqs sizing while k/v use padded_num_tokens sizing;
+    cu_q_lens maps seq index → token index to bridge the two.
+    Only distribution[0] real decode sequences owned by this DCP device
+    are actually written; the rest are masked.
+    """
+    dcp_size = mesh.shape['dcp']
+    tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+
+    num_kv_heads = k.shape[1]
+    if num_kv_heads < tp_size:
+        factor = tp_size // num_kv_heads
+        k = jnp.repeat(k, factor, axis=1)
+        v = jnp.repeat(v, factor, axis=1)
+
+    cp_rank_global = jnp.arange(dcp_size, dtype=jnp.int32)
+
+    kv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
+    kv_cache_spec = P(ShardingAxisName.BATCH, ShardingAxisName.CONTEXT,
+                      ShardingAxisName.KV_CACHE_HEAD, None, None)
+
+    def _write_shard(k_local, v_local, cache, kv_lens_local, page_indices_local,
+                     cu_q_lens_local, distribution_local, cp_rank_arr):
+        merged_kv = rpa_v3_cp.merge_kv(k_local, v_local)
+        return _write_kv_pallas.write_decode_kv(
+            merged_kv=merged_kv,
+            kv_cache=cache,
+            kv_lens=kv_lens_local,
+            page_indices=page_indices_local,
+            cu_q_lens=cu_q_lens_local,
+            distribution=distribution_local,
+            cp_rank=cp_rank_arr,
+            cp_group_size=dcp_size,
+        )
+
+    return jax.shard_map(
+        _write_shard,
+        mesh=mesh,
+        in_specs=(
+            kv_spec,
+            kv_spec,
+            kv_cache_spec,
+            P(ShardingAxisName.ATTN_DATA),
+            P(ShardingAxisName.ATTN_DATA),
+            P(ShardingAxisName.ATTN_DATA),
+            P(ShardingAxisName.ATTN_DATA),
+            P(ShardingAxisName.CONTEXT),
+        ),
+        out_specs=kv_cache_spec,
+        check_vma=False,
+    )(k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution,
+      cp_rank_global)
+
+
+def forward_decode(
     kv_cache: jax.Array,
     q: jax.Array,
     k: jax.Array,
@@ -685,27 +754,101 @@ def forward_with_dcp(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-):
-    """
-    DCP Attention forward pass.
+) -> tuple[jax.Array, jax.Array]:
+    """DCP decode forward pass (q_len=1 per sequence).
 
-    Phase 1: Context Attention (Attending to KV caches)
-    Phase 2: Query Attention (Attending to current tokens K, V)
-    Phase 3: Combine and Sharding
+    Phase A: Write the new decode token into the local DCP cache shard using
+             plain JAX scatter. Each device only writes to the slot it owns
+             (determined by get_cp_local_size / cp_rank).
+
+    Phase B: Context-only attention over the updated cache.
+             kv_lens + 1 shifts kv_cache_len_local by one token so the kernel
+             includes the just-written position in each device's local range.
+             No merge_attn_states needed — the new token's contribution arrives
+             from whichever DCP shard owns its page.
     """
     if head_dim_original is None:
         head_dim_original = q.shape[-1]
-
     if sm_scale is None:
         sm_scale = head_dim_original**-0.5
 
     md = attention_metadata
 
-    # ==========================================================================
-    # Phase 1: Context Attention (Attending to KV caches)
-    # `kv_caches` is not modified in the phase.
-    # ==========================================================================
+    # Phase A: write the new decode token using plain JAX (no Pallas kernel).
+    # updated_kv_cache = _jax_write_decode_kv(
+    #     mesh=mesh,
+    #     k=k,
+    #     v=v,
+    #     kv_cache=kv_cache,
+    #     kv_lens=md.seq_lens,
+    #     page_indices=md.block_tables,
+    #     cu_q_lens=md.query_start_loc,
+    #     distribution=md.request_distribution,
+    # )
 
+    # Phase B: attend to the full cache (new token now in the owner's shard).
+    # skip_non_local_tokens masks the new decode token on non-owner DCP devices,
+    # so each device attends to its cache history plus its own new token only.
+    attn_out, updated_kv_cache, lse = sharded_ragged_paged_attention_experimental(
+        mesh=mesh,
+        q=q,
+        k=k,
+        v=v,
+        kv_cache=kv_cache,
+        kv_lens=md.seq_lens + 1,
+        paged_indices=md.block_tables,
+        cu_q_lens=md.query_start_loc,
+        distribution=md.request_distribution,
+        attention_sink=sinks,
+        sm_scale=sm_scale,
+        attention_chunk_size=attention_chunk_size,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        use_causal_mask=False,
+        # update_kv_cache=False,
+        # skip_current_attn=False,
+        update_kv_cache=True, 
+        skip_non_local_tokens=True,
+        return_lse=True,
+        is_context_phase=True
+    )
+
+    final_output, _ = dcp_alltoall(attn_out, lse, mesh=mesh)
+    return updated_kv_cache, final_output
+
+
+def forward_prefill(
+    kv_cache: jax.Array,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    attention_metadata: AttentionMetadata,
+    mesh: Mesh,
+    head_dim_original: int | None = None,
+    sm_scale: float | None = None,
+    sinks: jax.Array | None = None,
+    attention_chunk_size: int | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """DCP prefill/mixed forward pass.
+
+    Phase 1: Context Attention — Q attends to the existing KV cache (no write,
+             no current tokens). Output sharded by DCP for the all-to-all.
+    Phase 2: Query Attention — Q attends to current tokens and writes them to
+             the cache. Uses standard (non-DCP) sharding.
+    Phase 3: Combine Phase 1 and Phase 2 results via LSE-weighted merge.
+    """
+    if head_dim_original is None:
+        head_dim_original = q.shape[-1]
+    if sm_scale is None:
+        sm_scale = head_dim_original**-0.5
+
+    md = attention_metadata
+
+    # Phase 1: attend to KV cache only.
     context_attn_out, kv_cache, context_lse = sharded_ragged_paged_attention_experimental(
         mesh=mesh,
         q=q,
@@ -726,15 +869,13 @@ def forward_with_dcp(
         is_context_phase=True,
         return_lse=True,
         skip_current_attn=True,
-        use_causal_mask=False)
+        use_causal_mask=False,
+    )
 
-    context_attn_out_cor, context_lse_cor = dcp_alltoall(context_attn_out,
-                                                         context_lse,
-                                                         mesh=mesh)
+    context_attn_out_cor, context_lse_cor = dcp_alltoall(
+        context_attn_out, context_lse, mesh=mesh)
 
-    # ==========================================================================
-    # Phase 2: Query Attention (Attending to current tokens K, V)
-    # ==========================================================================
+    # Phase 2: attend to current tokens and write them to the cache.
     query_attn_out, updated_kv_cache, query_lse = sharded_ragged_paged_attention_experimental(
         mesh=mesh,
         q=q,
@@ -756,9 +897,7 @@ def forward_with_dcp(
         return_lse=True,
     )
 
-    # ==========================================================================
-    # Phase 3: Combine Context and Query results
-    # ==========================================================================
+    # Phase 3: combine cache and current-token attention via LSE-weighted merge.
     final_output, _ = merge_attn_states(
         context_attn_out_cor,
         context_lse_cor,
@@ -767,6 +906,43 @@ def forward_with_dcp(
     )
 
     return updated_kv_cache, final_output
+
+
+def forward_with_dcp(
+    kv_cache: jax.Array,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    attention_metadata: AttentionMetadata,
+    mesh: Mesh,
+    head_dim_original: int | None = None,
+    sm_scale: float | None = None,
+    sinks: jax.Array | None = None,
+    attention_chunk_size: int | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    is_decode: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """DCP attention dispatcher: routes to forward_decode or forward_prefill."""
+    common_kwargs = dict(
+        kv_cache=kv_cache,
+        q=q,
+        k=k,
+        v=v,
+        attention_metadata=attention_metadata,
+        mesh=mesh,
+        head_dim_original=head_dim_original,
+        sm_scale=sm_scale,
+        sinks=sinks,
+        attention_chunk_size=attention_chunk_size,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    if is_decode:
+        return forward_decode(**common_kwargs)
+    return forward_prefill(**common_kwargs)
 
 
 def attention(
@@ -821,6 +997,7 @@ def attention(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            is_decode=md.is_decode,
         )
 
     # (T, N, H)

@@ -27,7 +27,15 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _write_decode_kv_kernel(
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+# 💡 定義編譯期常數 GROUP_SIZE (推薦 4 或 8，對齊 TPU 向量長度)
+GROUP_SIZE = 16
+
+def _write_decode_kv_kernel_optimized(
     # ── Scalar prefetch (loaded into SMEM before kernel starts) ─────────────
     kv_lens_ref,          # i32[max_num_seqs]
     page_indices_ref,     # i32[max_num_seqs * pages_per_seq]
@@ -38,67 +46,113 @@ def _write_decode_kv_kernel(
     merged_kv_hbm_ref,    # bf16[max_num_tokens, nh_x2//kp, kp, head_dim]
     kv_cache_hbm_ref,     # bf16[local_pages, local_page_size, nh_x2//kp, kp, hd]
     updated_kv_cache_hbm_ref,  # same shape, aliased with kv_cache (in-place)
-    # ── VMEM scratch ────────────────────────────────────────────────────────
-    kv_slot_ref,          # VMEM bf16[1, nh_x2//kp, kp, head_dim]  staging buf
-    sem,                  # DMA semaphore [1]
+    # ── VMEM scratch (⚠ 擴充為 GROUP_SIZE 大小以支援並行緩衝) ───────────────────
+    kv_slot_ref,          # VMEM bf16[GROUP_SIZE, 1, nh_x2//kp, kp, head_dim]
+    sem,                  # DMA semaphore [GROUP_SIZE] 
     *,
     # ── Static params ───────────────────────────────────────────────────────
     cp_group_size: int,
     pages_per_seq: int,
 ):
-    # grid dim 0 == seq_idx; one invocation per (padded) sequence.
-    # @pl.when is at the TOP LEVEL of the kernel body — not inside a fori_loop.
-    # Nesting @pl.when + DMA inside lax.fori_loop causes Pallas to track DMA
-    # semaphore effects as extra while_loop carry, producing a pytree mismatch
-    # when the false branch has no matching DMA effects.
-    seq_idx = pl.program_id(0)
-
+    # Grid 0 現在代表 Batch Group 的索引
+    batch_idx = pl.program_id(0)
+    base_seq_idx = batch_idx * GROUP_SIZE
+    
     local_page_size = kv_cache_hbm_ref.shape[1]
     cp_rank = cp_rank_ref[0]
-
-    # Flatten [local_pages, local_page_size, ...] → [local_pages*local_page_size, ...]
-    # Bitcast inside Pallas (no copy), enabling flat DMA addressing.
+    
+    # 扁平化 Cache 以進行扁平 DMA 定址
     cs = updated_kv_cache_hbm_ref.shape
     cache_flat = updated_kv_cache_hbm_ref.reshape(cs[0] * cs[1], *cs[2:])
 
-    kv_len = kv_lens_ref[seq_idx]
-    # kv_lens[i] includes the new decode token → write at kv_len - 1.
-    write_pos = kv_len - 1
+    # =========================================================================
+    # PHASE 1: 🚀 統一起動 8 路 HBM -> VMEM 讀取 (Non-blocking)
+    # =========================================================================
+    for i in range(GROUP_SIZE):
+        seq_idx = base_seq_idx + i
+        
+        # 📌 防禦性設計：避免 Padded Sequence 造成 HBM 越界存取
+        safe_seq_idx = jnp.minimum(seq_idx, distribution_ref[0] - 1)
+        write_pos = kv_lens_ref[safe_seq_idx] - 1
+        
+        # 動態條件判定：是否屬於當前 CP rank 且為有效序列
+        cond = (seq_idx < distribution_ref[0]) & (write_pos % cp_group_size == cp_rank)
+        
+        @pl.when(cond)
+        def _start_read():
+            token_i = cu_q_lens_ref[safe_seq_idx]
+            pltpu.make_async_copy(
+                merged_kv_hbm_ref.at[pl.ds(token_i, 1)],
+                kv_slot_ref.at[pl.ds(i, 1)],  # 💡 保持 4D 切片形狀
+                sem.at[i],
+            ).start()
 
-    # Guard: only real decode seqs (seq_idx < num_decode) owned by this DCP rank.
-    @pl.when((seq_idx < distribution_ref[0]) & (write_pos % cp_group_size == cp_rank))
-    def do_write():
-        local_pos = (write_pos + cp_group_size - 1 - cp_rank) // cp_group_size
-        kv_p   = local_pos // local_page_size
-        kv_off = local_pos % local_page_size
+    # =========================================================================
+    # PHASE 2: 🛑 統一等待所有 HBM -> VMEM 讀取完成 (Barrier)
+    # =========================================================================
+    for i in range(GROUP_SIZE):
+        seq_idx = base_seq_idx + i
+        safe_seq_idx = jnp.minimum(seq_idx, distribution_ref[0] - 1)
+        write_pos = kv_lens_ref[safe_seq_idx] - 1
+        cond = (seq_idx < distribution_ref[0]) & (write_pos % cp_group_size == cp_rank)
+        
+        @pl.when(cond)
+        def _wait_read():
+            token_i = cu_q_lens_ref[safe_seq_idx]
+            pltpu.make_async_copy(
+                merged_kv_hbm_ref.at[pl.ds(token_i, 1)],
+                kv_slot_ref.at[pl.ds(i, 1)],  # 💡 保持 4D 切片形狀
+                sem.at[i],
+            ).wait()
 
-        phys_page = page_indices_ref[seq_idx * pages_per_seq + kv_p]
-        token_i   = cu_q_lens_ref[seq_idx]  # first (only) token for this seq
+    # =========================================================================
+    # PHASE 3: 🚀 統一起動 8 路 VMEM -> HBM Cache 寫入 (Non-blocking)
+    # =========================================================================
+    for i in range(GROUP_SIZE):
+        seq_idx = base_seq_idx + i
+        safe_seq_idx = jnp.minimum(seq_idx, distribution_ref[0] - 1)
+        write_pos = kv_lens_ref[safe_seq_idx] - 1
+        cond = (seq_idx < distribution_ref[0]) & (write_pos % cp_group_size == cp_rank)
+        
+        @pl.when(cond)
+        def _start_write():
+            local_pos = (write_pos + cp_group_size - 1 - cp_rank) // cp_group_size
+            kv_p = local_pos // local_page_size
+            kv_off = local_pos % local_page_size
+            phys_page = page_indices_ref[safe_seq_idx * pages_per_seq + kv_p]
+            flat_idx = phys_page * local_page_size + kv_off
+            
+            # 💡 這裡必須使用 .at[pl.ds(i, 1)] 保持 4D
+            pltpu.make_async_copy(
+                kv_slot_ref.at[pl.ds(i, 1)],  
+                cache_flat.at[pl.ds(flat_idx, 1)],
+                sem.at[i],
+            ).start()
 
-        # Step 1: DMA load merged_kv[token_i] from HBM → VMEM staging buf.
-        pltpu.make_async_copy(
-            merged_kv_hbm_ref.at[pl.ds(token_i, 1)],
-            kv_slot_ref,
-            sem.at[0],
-        ).start()
-        pltpu.make_async_copy(
-            merged_kv_hbm_ref.at[pl.ds(token_i, 1)],
-            kv_slot_ref,
-            sem.at[0],
-        ).wait()
+    # =========================================================================
+    # PHASE 4: 🛑 確保所有資料安全寫回 HBM (Safe Exit)
+    # =========================================================================
+    for i in range(GROUP_SIZE):
+        seq_idx = base_seq_idx + i
+        safe_seq_idx = jnp.minimum(seq_idx, distribution_ref[0] - 1)
+        write_pos = kv_lens_ref[safe_seq_idx] - 1
+        cond = (seq_idx < distribution_ref[0]) & (write_pos % cp_group_size == cp_rank)
+        
+        @pl.when(cond)
+        def _wait_write():
+            local_pos = (write_pos + cp_group_size - 1 - cp_rank) // cp_group_size
+            kv_p = local_pos // local_page_size
+            kv_off = local_pos % local_page_size
+            phys_page = page_indices_ref[safe_seq_idx * pages_per_seq + kv_p]
+            flat_idx = phys_page * local_page_size + kv_off
+            
+            # 💡 這裡也必須使用 .at[pl.ds(i, 1)] 保持 4D
+            pltpu.make_async_copy(
+                kv_slot_ref.at[pl.ds(i, 1)],  
+                cache_flat.at[pl.ds(flat_idx, 1)],
+                sem.at[i],
+            ).wait()
 
-        # Step 2: DMA store VMEM staging buf → cache HBM at (phys_page, kv_off).
-        flat_idx = phys_page * local_page_size + kv_off
-        pltpu.make_async_copy(
-            kv_slot_ref,
-            cache_flat.at[pl.ds(flat_idx, 1)],
-            sem.at[0],
-        ).start()
-        pltpu.make_async_copy(
-            kv_slot_ref,
-            cache_flat.at[pl.ds(flat_idx, 1)],
-            sem.at[0],
-        ).wait()
 
 @jax.jit(
     static_argnames=("cp_group_size"), donate_argnames="kv_cache",
@@ -139,10 +193,10 @@ def write_decode_kv(
     _, _, num_kv_heads_x2_per_kp, kv_packing, head_dim = kv_cache.shape
 
     kv_slot_scratch = pltpu.VMEM(
-        (1, num_kv_heads_x2_per_kp, kv_packing, head_dim),
+        (GROUP_SIZE, num_kv_heads_x2_per_kp, kv_packing, head_dim),
         kv_cache.dtype,
     )
-    sem_scratch = pltpu.SemaphoreType.DMA((1,))
+    sem_scratch = pltpu.SemaphoreType.DMA((GROUP_SIZE,))
 
     scalar_prefetches = (kv_lens, page_indices, cu_q_lens, distribution, cp_rank)
     num_scalar_prefetch = len(scalar_prefetches)
@@ -151,7 +205,7 @@ def write_decode_kv(
 
     kernel = pl.pallas_call(
         functools.partial(
-            _write_decode_kv_kernel,
+            _write_decode_kv_kernel_optimized,
             cp_group_size=cp_group_size,
             pages_per_seq=pages_per_seq,
         ),
@@ -164,7 +218,7 @@ def write_decode_kv(
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),  # updated_kv_cache
             # One grid cell per (padded) sequence; @pl.when guards non-owners.
             # "arbitrary" ensures sequential execution → single shared VMEM scratch.
-            grid=(max_num_seqs,),
+            grid=(max_num_seqs // GROUP_SIZE,),
             scratch_shapes=[kv_slot_scratch, sem_scratch],
         ),
         compiler_params=pltpu.CompilerParams(

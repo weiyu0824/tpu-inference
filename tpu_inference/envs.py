@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     DRAFT_MODEL_IMPL_TYPE: str = "auto"
     NEW_MODEL_DESIGN: bool = False
     PHASED_PROFILING_DIR: str = ""
+    PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD: int = -1
+    PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD: int = -1
     AGGREGATED_STATS_DIR: str = ""
     PYTHON_TRACER_LEVEL: int = 1
     USE_MOE_EP_KERNEL: bool = False
@@ -252,6 +254,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Directory to store phased profiling output
     "PHASED_PROFILING_DIR":
     lambda: os.getenv("PHASED_PROFILING_DIR", ""),
+    # For decode-only batches, skip profiling until min KV len >= threshold (-1 to disable)
+    "PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD":
+    lambda: int(os.getenv("PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD", "-1")),
+    # For prefill-only batches, skip profiling until min KV len >= threshold (-1 to disable)
+    "PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD":
+    lambda: int(os.getenv("PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD", "-1")),
     # Python tracer level for profiling
     "PYTHON_TRACER_LEVEL":
     lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),
