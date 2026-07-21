@@ -14,6 +14,7 @@
 
 import functools
 import math
+import os
 from typing import Any, Callable, Optional, Tuple
 
 import jax
@@ -774,28 +775,11 @@ def forward_decode(
 
     md = attention_metadata
 
-    # Phase A: write the new decode token using plain JAX (no Pallas kernel).
-    # updated_kv_cache = _jax_write_decode_kv(
-    #     mesh=mesh,
-    #     k=k,
-    #     v=v,
-    #     kv_cache=kv_cache,
-    #     kv_lens=md.seq_lens,
-    #     page_indices=md.block_tables,
-    #     cu_q_lens=md.query_start_loc,
-    #     distribution=md.request_distribution,
-    # )
+    _option = int(os.environ.get("DCP_DECODE_OPTION", "2"))
 
-    # Phase B: attend to the full cache (new token now in the owner's shard).
-    # skip_non_local_tokens masks the new decode token on non-owner DCP devices,
-    # so each device attends to its cache history plus its own new token only.
-    attn_out, updated_kv_cache, lse = sharded_ragged_paged_attention_experimental(
+    _common = dict(
         mesh=mesh,
-        q=q,
-        k=k,
-        v=v,
-        kv_cache=kv_cache,
-        kv_lens=md.seq_lens + 1,
+        q=q, k=k, v=v,
         paged_indices=md.block_tables,
         cu_q_lens=md.query_start_loc,
         distribution=md.request_distribution,
@@ -806,15 +790,80 @@ def forward_decode(
         k_scale=k_scale,
         v_scale=v_scale,
         use_causal_mask=False,
-        # update_kv_cache=False,
-        # skip_current_attn=False,
-        update_kv_cache=True, 
-        skip_non_local_tokens=True,
         return_lse=True,
-        is_context_phase=True
     )
 
-    final_output, _ = dcp_alltoall(attn_out, lse, mesh=mesh)
+    if _option == 1:
+        # Option 1: write new decode token first, then attend to the full cache
+        # (kv_lens+1 ensures the just-written token is included).
+        updated_kv_cache = _jax_write_decode_kv(
+            mesh=mesh,
+            k=k,
+            v=v,
+            kv_cache=kv_cache,
+            kv_lens=md.seq_lens,
+            page_indices=md.block_tables,
+            cu_q_lens=md.query_start_loc,
+            distribution=md.request_distribution,
+        )
+        attn_out, updated_kv_cache, lse = sharded_ragged_paged_attention_experimental(
+            kv_cache=updated_kv_cache,
+            kv_lens=md.seq_lens,
+            update_kv_cache=False,
+            skip_current_attn=False,
+            is_context_phase=True,
+            **_common,
+        )
+        final_output, _ = dcp_alltoall(attn_out, lse, mesh=mesh)
+
+    elif _option == 2:
+        # Option 2: merged kernel — skip_non_local_tokens masks the new decode
+        # token on non-owner DCP devices so each shard only attends to its own.
+        # kv_lens must be cache_len + q_len (same as option 1) so the CP kernel's
+        # get_kv_cache_len_local correctly recovers cache_len via (kv_lens - q_len).
+        attn_out, updated_kv_cache, lse = sharded_ragged_paged_attention_experimental(
+            kv_cache=kv_cache,
+            kv_lens=md.seq_lens,
+            update_kv_cache=True,
+            skip_non_local_tokens=True,
+            is_context_phase=True,
+            **_common,
+        )
+        final_output, _ = dcp_alltoall(attn_out, lse, mesh=mesh)
+
+    elif _option == 3:
+        # Option 3: two-phase — smaller bkv_sz per kernel call.
+        # Phase 1: attend to existing KV cache only (no write).
+        # kv_lens=seq_lens+1 so CP kernel recovers cache_len=(kv_lens-q_len).
+        context_attn_out, update_kv_cache, context_lse = sharded_ragged_paged_attention_experimental(
+            kv_cache=kv_cache,
+            kv_lens=md.seq_lens,
+            update_kv_cache=False,
+            skip_current_attn=True,
+            is_context_phase=True,
+            **_common,
+        )
+        context_attn_out_cor, context_lse_cor = dcp_alltoall(
+            context_attn_out, context_lse, mesh=mesh)
+
+        # Phase 2: write new token and attend to it only.
+        # kv_lens=seq_lens+1 so kv_cache_len_local=cache_len, placing the
+        # new token correctly at local index cache_len (not cache_len-1).
+        query_attn_out, updated_kv_cache, query_lse = sharded_ragged_paged_attention_experimental(
+            kv_cache=update_kv_cache,
+            kv_lens=md.seq_lens,
+            update_kv_cache=True,
+            skip_cache_attn=True,
+            is_context_phase=False,
+            **_common,
+        )
+        final_output, _ = merge_attn_states(
+            context_attn_out_cor, context_lse_cor, query_attn_out, query_lse)
+
+    else:
+        raise ValueError(
+            f"Unknown DCP_DECODE_OPTION={_option!r}. Valid values: 1, 2, 3.")
+
     return updated_kv_cache, final_output
 
 

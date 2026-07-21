@@ -583,20 +583,17 @@ def _ragged_paged_attention_kernel_loop(
                           jnp.array(0.0, dtype=v.dtype))
 
         if skip_non_local_tokens:
-            # For new (current) token slots in the BKV buffer (local index >=
-            # kv_cache_len_local), only include the ones whose global position
-            # is owned by this DCP device.  Cache slots are always included.
-            kv_cache_len_local_int = kv_cache_len_local.astype(int_ty)
-            cp_rank_int = cp_rank.astype(int_ty)
-            global_kv_old_int = global_kv_old.astype(int_ty)
-            is_new_k = k_span >= kv_cache_len_local_int
-            owned_k = ((global_kv_old_int + k_span - kv_cache_len_local_int) %
-                       cp_group_size) == cp_rank_int
-            mask = mask_and(mask, jnp.where(is_new_k, owned_k, True))
-            is_new_v = v_span >= kv_cache_len_local_int
-            owned_v = ((global_kv_old_int + v_span - kv_cache_len_local_int) %
-                       cp_group_size) == cp_rank_int
-            v = jnp.where(jnp.where(is_new_v, owned_v, True), v,
+            # Keep a KV position if it is in cache, or is a new token owned by
+            # this rank: (global_kv_old + local_new_offset) % cp_group_size == rank.
+            kv_cache_len_i32 = kv_cache_len_local.astype(jnp.int32)
+            global_kv_old_i32 = global_kv_old.astype(jnp.int32)
+            cp_rank_i32 = cp_rank.astype(jnp.int32)
+            k_i32 = k_span.astype(jnp.int32)
+            v_i32 = v_span.astype(jnp.int32)
+            owned_k = (global_kv_old_i32 + k_i32 - kv_cache_len_i32) % cp_group_size == cp_rank_i32
+            mask = mask_and(mask, (k_i32 < kv_cache_len_i32) | owned_k)
+            owned_v = (global_kv_old_i32 + v_i32 - kv_cache_len_i32) % cp_group_size == cp_rank_i32
+            v = jnp.where((v_i32 < kv_cache_len_i32) | owned_v, v,
                           jnp.array(0.0, dtype=v.dtype))
 
         if mask is not None:
@@ -1845,7 +1842,7 @@ def get_default_block_sizes(
     max_q = next_power_of_2(max_num_tokens)
     max_kv = pages_per_seq * page_size
 
-    min_bkv_sz_to_peak = (16 * 1024 * 1024 * kv_packing // 4 // head_dim //
+    min_bkv_sz_to_peak = (8 * 1024 * 1024 * kv_packing // 4 // head_dim //
                           num_kv_heads_x2)
 
     match tpu_version:
