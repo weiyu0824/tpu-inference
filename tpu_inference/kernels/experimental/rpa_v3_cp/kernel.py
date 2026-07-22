@@ -32,6 +32,10 @@ from jax.experimental.pallas import tpu as pltpu
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing, get_tpu_version, next_power_of_2)
 
+# Recentering constant for the CS fixed-m path. The stored m is (cs_bound - C),
+# keeping exp arguments near zero for better numerical range.
+_FIXED_M_RECENTER = 0.0
+
 
 class RpaCase(Enum):
     """Represents the different cases for Ragged Paged Attention.
@@ -340,6 +344,7 @@ def _ragged_paged_attention_kernel_loop(
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
     kv_shuffle_vmem_ref=None,  # [bkv_sz // cp_group_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
+    mk_ref=None,  # [max_num_seqs, actual_num_kv_heads] f32 scalar prefetch: max ||k||₂ per seq/head
     *,
     # Static kwargs
     cp_group_size: int | None = None,
@@ -364,6 +369,7 @@ def _ragged_paged_attention_kernel_loop(
     debug_mode: bool = False,
     return_lse: bool = False,
     skip_non_local_tokens: bool = False,
+    use_fixed_m: bool = True,
 ):
 
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -599,21 +605,28 @@ def _ragged_paged_attention_kernel_loop(
         if mask is not None:
             s = jnp.where(mask, s, jnp.array(mask_value, dtype=s.dtype))
 
-        s_rowmax = jnp.max(s, axis=1, keepdims=True)
-
-        # if converting the type too early, there will be accuracy issue.
-        s_rowmax = s_rowmax.astype(out_dtype)
-        m_prev = m_ref[...]
-        m_curr = jnp.maximum(m_prev, s_rowmax)
-        m_ref[...] = m_curr
-        p = jnp.exp(s -
-                    broadcast_minor(m_curr, s.shape).astype(s.dtype)).astype(
-                        v.dtype)
-
-        p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
-        l_prev = l_ref[...]
-        l_ref[...] = exp_m_diff * l_prev + p_rowsum
+        if use_fixed_m:
+            # m is fixed (CS bound set once per bq block in wait_cur_bq).
+            # No per-block reduce_max or alpha-rescale needed.
+            m_curr = m_ref[...]
+            p = jnp.exp(s - broadcast_minor(m_curr, s.shape).astype(
+                s.dtype)).astype(v.dtype)
+            p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
+            l_ref[...] = l_ref[...] + p_rowsum
+            exp_m_diff = jnp.ones_like(m_curr)
+        else:
+            s_rowmax = jnp.max(s, axis=1, keepdims=True)
+            # if converting the type too early, there will be accuracy issue.
+            s_rowmax = s_rowmax.astype(out_dtype)
+            m_prev = m_ref[...]
+            m_curr = jnp.maximum(m_prev, s_rowmax)
+            m_ref[...] = m_curr
+            p = jnp.exp(s - broadcast_minor(m_curr, s.shape).astype(
+                s.dtype)).astype(v.dtype)
+            p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
+            exp_m_diff = jnp.exp(m_prev - m_curr)
+            l_prev = l_ref[...]
+            l_ref[...] = exp_m_diff * l_prev + p_rowsum
 
         return p, v, exp_m_diff
 
@@ -1181,10 +1194,11 @@ def _ragged_paged_attention_kernel_loop(
 
         @pl.loop(0, num_bq, unroll=False)
         def compute_with_bq(bq_idx):
-            # Re-initialize l, m, acc to 0 before bkv loop.
+            # Re-initialize l, acc to 0 before bkv loop.
             l_ref[...] = jnp.full_like(l_ref, 0.0)
-            m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
             acc_ref[...] = jnp.full_like(acc_ref, 0.0)
+            if not use_fixed_m:
+                m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
 
             bq_sem_idx = sem_ids_ref[0]
             next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
@@ -1246,6 +1260,27 @@ def _ragged_paged_attention_kernel_loop(
                 @pl.when(bkv_idx == start_bkv_idx)
                 def wait_cur_bq():
                     wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+                    if use_fixed_m:
+                        # q is now in VMEM; compute per-row CS bound and set m once.
+                        # CS: max_j(q_i · k_j * sm_scale) ≤ ||q_i||₂ * mk * sm_scale
+                        for bq_start in range(0, actual_bq_sz, actual_bq_csz):
+                            for kv_head_idx in range(actual_num_kv_heads):
+                                bq_c = load_bq(bq_sem_idx, kv_head_idx,
+                                               bq_start, actual_bq_csz)
+                                q_norms = jnp.sqrt(
+                                    jnp.sum(bq_c * bq_c, axis=-1,
+                                            dtype=jnp.float32))  # [bq_csz * G]
+                                mk = (mk_ref[seq_idx, kv_head_idx]
+                                      if mk_ref is not None
+                                      else jnp.sqrt(float(head_dim)))  # fallback: unit-norm K
+                                m_fixed = (jnp.ceil(q_norms * mk * sm_scale) -
+                                           _FIXED_M_RECENTER)
+                                lm_start = bq_start * num_q_heads_per_kv_head
+                                lm_sz = actual_bq_csz * num_q_heads_per_kv_head
+                                m_ref[kv_head_idx, pl.ds(lm_start, lm_sz), :] = (
+                                    jnp.broadcast_to(
+                                        m_fixed[:, None].astype(out_dtype),
+                                        (lm_sz, 128)))
 
                 # Wait for cur bkv
                 offset, update_sz, src_start_base = wait_fetch_bkv(
@@ -1915,6 +1950,7 @@ def get_default_block_sizes(
         "update_kv_cache",
         "cp_group_size",
         "skip_non_local_tokens",
+        "use_fixed_m",
     ),
     donate_argnames="kv_cache",
 )
@@ -1965,6 +2001,7 @@ def ragged_paged_attention(
     disable_bounds_checks: bool = True,
     disable_semaphore_checks: bool = True,
     skip_non_local_tokens: bool = False,
+    use_fixed_m: bool = True,
 ):
     """Ragged paged attention that supports mixed prefill and decode.
 
@@ -2233,6 +2270,7 @@ def ragged_paged_attention(
                 update_kv_cache=update_kv_cache,
                 return_lse=return_lse,
                 skip_non_local_tokens=skip_non_local_tokens,
+                use_fixed_m=use_fixed_m,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=num_scalers,
