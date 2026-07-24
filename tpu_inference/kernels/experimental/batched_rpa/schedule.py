@@ -64,6 +64,10 @@ class RpaSchedule:
     k_idx: SmemWrapper  # [steps, batch]
     is_last_k: SmemWrapper  # [steps, batch]
     do_writeback: SmemWrapper  # [steps, batch]
+    # global_cache_len % cp_group_size; 0 when CP is disabled.  Tells
+    # copy_out which rank owns the first new token in this block so the
+    # strided shuffle reads the correct interleaved offset.
+    new_tok_off: SmemWrapper  # [steps, batch]
     dma_q: SmemWrapper  # [steps, batch, 2]
     dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 3]
     dma_kv_new: SmemWrapper  # [steps, batch, bkv_p_new, 4]
@@ -83,6 +87,7 @@ class RpaSchedule:
             k_idx=idx_wrapper,
             is_last_k=idx_wrapper,
             do_writeback=idx_wrapper,
+            new_tok_off=idx_wrapper,
             dma_q=SmemWrapper.create_shape_dtype(
                 (cfgs.max_steps_ub, cfgs.batch_size, 2)),
             dma_kv_cache=SmemWrapper.create_shape_dtype(
@@ -167,6 +172,7 @@ def compute_metadata(
     *,
     cfgs: configs.RpaConfigs,
     update_kv_cache: bool = True,
+    cp_rank_ref: jax.Ref | None = None,
 ):
     """Fill metadata using triple nested loop of seq->q->k loop.
 
@@ -192,6 +198,7 @@ def compute_metadata(
         k_len,
         q_len,
         end_k_idx,
+        global_cache_len,
     ):
 
         schedule.s_idx[step, target_lane] = s_idx
@@ -238,49 +245,128 @@ def compute_metadata(
         q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
 
         do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
+        if cfgs.serve.cp_group_size is not None and cfgs.mode == configs.RpaCase.DECODE:
+            # For DCP decode (new_sz=1): only write back if this rank owns the
+            # new token.  global_cache_len tells us which global position the
+            # first new token occupies; its rank is global_cache_len % G.
+            cp_cond = (global_cache_len % cfgs.serve.cp_group_size) == cp_rank_ref[0]
+            do_writeback = jnp.where(cp_cond, do_writeback, 0)
+        # For prefill CP (new_sz>1): do_writeback unchanged; copy_out handles
+        # the strided shuffle from VMEM to the local KV cache positions.
         schedule.do_writeback[step, target_lane] = do_writeback
+
+        # Store the rank that owns the FIRST new token in THIS block so that
+        # copy_out can compute the correct strided-shuffle starting offset.
+        # j_start = number of new tokens in previous blocks for this sequence.
+        # The j_start-th new token has global position global_cache_len+j_start,
+        # so its owning rank is (global_cache_len + j_start) % G.
+        if cfgs.serve.cp_group_size is not None:
+            local_cache_len = k_len - q_len
+            j_start = jnp.maximum(0, kv_len_start - local_cache_len)
+            schedule.new_tok_off[step, target_lane] = (
+                (global_cache_len + j_start) % cfgs.serve.cp_group_size)
+        else:
+            schedule.new_tok_off[step, target_lane] = 0
+
         src_hbm = q_end - kv_left_frm_new
 
-        if cfgs.bkv_p_new < cfgs.bkv_p:
-            # Special case where we only need to write back one page.
-            assert cfgs.bkv_p_new == 1
-            dst_vmem = bkv_sz_cache
-            dma_sz = new_sz
+        if cfgs.serve.cp_group_size is not None:
+            # CP path: after the strided shuffle, rank's new tokens are packed
+            # consecutively.  Store LOCAL-position-based HBM destinations and
+            # pre-computed local_sz per page slot so that copy_out can DMA
+            # directly without recomputing first_idx.
+            G = cfgs.serve.cp_group_size
+            rank = cp_rank_ref[0]
+            local_cache_len = k_len - q_len
+            j_start = jnp.maximum(0, kv_len_start - local_cache_len)
+            new_tok_off_block = (global_cache_len + j_start) % G
+            first_idx_block = (rank - new_tok_off_block + G) % G
+            local_sz_total = jnp.maximum(
+                0, (new_sz - first_idx_block + G - 1) // G)
+            # j_start_rank: how many of rank's new tokens appeared before this block
+            first_idx_seq = (rank - global_cache_len % G + G) % G
+            j_start_rank = jnp.maximum(
+                0, (j_start - first_idx_seq + G - 1) // G)
 
-            p_idx = (kv_len_start + dst_vmem) >> cfgs.serve.page_size_log2
-            p_idx = jnp.minimum(p_idx, cfgs.serve.pages_per_seq - 1)
-            p_off = (kv_len_start + dst_vmem) & cfgs.serve.page_size_mask
-            global_p_idx = s_idx * cfgs.serve.pages_per_seq + p_idx
-
-            dst_hbm = (global_p_idx << cfgs.serve.page_size_log2) | p_off
-            schedule.dma_kv_new[step, target_lane, 0, 0] = dst_hbm
-            schedule.dma_kv_new[step, target_lane, 0, 1] = src_hbm
-            schedule.dma_kv_new[step, target_lane, 0, 2] = dst_vmem
-            schedule.dma_kv_new[step, target_lane, 0, 3] = dma_sz
-        else:
-            for i in range(cfgs.bkv_p):
-                slot_start = i << cfgs.serve.page_size_log2
-                slot_end = (i + 1) << cfgs.serve.page_size_log2
-
-                dst_vmem = jnp.maximum(slot_start, bkv_sz_cache)
-                end_in_slot = jnp.minimum(slot_end, bkv_sz_cache + new_sz)
-                dma_sz = jnp.maximum(0, end_in_slot - dst_vmem)
-
-                p_idx = (kv_len_start + dst_vmem) >> cfgs.serve.page_size_log2
+            if cfgs.bkv_p_new < cfgs.bkv_p:
+                cp_tok_idx = local_cache_len + j_start_rank
+                p_idx = cp_tok_idx >> cfgs.serve.page_size_log2
                 p_idx = jnp.minimum(p_idx, cfgs.serve.pages_per_seq - 1)
-                p_off = (kv_len_start + dst_vmem) & cfgs.serve.page_size_mask
+                p_off = cp_tok_idx & cfgs.serve.page_size_mask
+                global_p_idx = s_idx * cfgs.serve.pages_per_seq + p_idx
+                dst_hbm = (global_p_idx << cfgs.serve.page_size_log2) | p_off
+                schedule.dma_kv_new[step, target_lane, 0, 0] = dst_hbm
+                schedule.dma_kv_new[step, target_lane, 0, 1] = src_hbm
+                schedule.dma_kv_new[step, target_lane, 0, 2] = bkv_sz_cache
+                # field[3] = global new_sz so copy_in fetches all new tokens;
+                # copy_out computes slot_local_sz on the fly from first_idx.
+                schedule.dma_kv_new[step, target_lane, 0, 3] = new_sz
+            else:
+                for i in range(cfgs.bkv_p_new):
+                    # Compute global per-page dma_sz (same as non-CP) so that
+                    # copy_in fetches all new tokens (new KV is NOT sharded).
+                    # copy_out computes slot_local_sz on the fly from first_idx.
+                    slot_start = i << cfgs.serve.page_size_log2
+                    slot_end = (i + 1) << cfgs.serve.page_size_log2
+                    dst_vmem_slot = jnp.maximum(slot_start, bkv_sz_cache)
+                    end_in_slot = jnp.minimum(slot_end, bkv_sz_cache + new_sz)
+                    dma_sz = jnp.maximum(0, end_in_slot - dst_vmem_slot)
+                    cp_tok_idx = (local_cache_len + j_start_rank
+                                  + i * cfgs.serve.page_size)
+                    p_idx = cp_tok_idx >> cfgs.serve.page_size_log2
+                    p_idx = jnp.minimum(p_idx, cfgs.serve.pages_per_seq - 1)
+                    p_off = cp_tok_idx & cfgs.serve.page_size_mask
+                    global_p_idx = s_idx * cfgs.serve.pages_per_seq + p_idx
+                    dst_hbm = (global_p_idx << cfgs.serve.page_size_log2) | p_off
+                    schedule.dma_kv_new[step, target_lane, i, 0] = dst_hbm
+                    schedule.dma_kv_new[step, target_lane, i, 1] = src_hbm
+                    schedule.dma_kv_new[step, target_lane, i, 2] = bkv_sz_cache
+                    schedule.dma_kv_new[step, target_lane, i, 3] = dma_sz
+        else:
+            # non-CP path: VMEM position == local HBM position.
+            if cfgs.bkv_p_new < cfgs.bkv_p:
+                # Special case where we only need to write back one page.
+                assert cfgs.bkv_p_new == 1
+                dst_vmem = bkv_sz_cache
+                dma_sz = new_sz
+
+                tok_idx = kv_len_start + dst_vmem
+                p_idx = tok_idx >> cfgs.serve.page_size_log2
+                p_idx = jnp.minimum(p_idx, cfgs.serve.pages_per_seq - 1)
+                p_off = tok_idx & cfgs.serve.page_size_mask
                 global_p_idx = s_idx * cfgs.serve.pages_per_seq + p_idx
 
                 dst_hbm = (global_p_idx << cfgs.serve.page_size_log2) | p_off
-                schedule.dma_kv_new[step, target_lane, i, 0] = dst_hbm
-                schedule.dma_kv_new[step, target_lane, i, 1] = src_hbm
-                schedule.dma_kv_new[step, target_lane, i, 2] = dst_vmem
-                schedule.dma_kv_new[step, target_lane, i, 3] = dma_sz
+                schedule.dma_kv_new[step, target_lane, 0, 0] = dst_hbm
+                schedule.dma_kv_new[step, target_lane, 0, 1] = src_hbm
+                schedule.dma_kv_new[step, target_lane, 0, 2] = dst_vmem
+                schedule.dma_kv_new[step, target_lane, 0, 3] = dma_sz
+            else:
+                for i in range(cfgs.bkv_p):
+                    slot_start = i << cfgs.serve.page_size_log2
+                    slot_end = (i + 1) << cfgs.serve.page_size_log2
+
+                    dst_vmem = jnp.maximum(slot_start, bkv_sz_cache)
+                    end_in_slot = jnp.minimum(slot_end, bkv_sz_cache + new_sz)
+                    dma_sz = jnp.maximum(0, end_in_slot - dst_vmem)
+
+                    tok_idx = kv_len_start + dst_vmem
+                    p_idx = tok_idx >> cfgs.serve.page_size_log2
+                    p_idx = jnp.minimum(p_idx, cfgs.serve.pages_per_seq - 1)
+                    p_off = tok_idx & cfgs.serve.page_size_mask
+                    global_p_idx = s_idx * cfgs.serve.pages_per_seq + p_idx
+
+                    dst_hbm = (global_p_idx << cfgs.serve.page_size_log2) | p_off
+                    schedule.dma_kv_new[step, target_lane, i, 0] = dst_hbm
+                    schedule.dma_kv_new[step, target_lane, i, 1] = src_hbm
+                    schedule.dma_kv_new[step, target_lane, i, 2] = dst_vmem
+                    schedule.dma_kv_new[step, target_lane, i, 3] = dma_sz
 
         return step + 1
 
     @jax.named_scope("q_loop")
-    def q_loop(q_idx, _, *, s_idx, q_start, q_end, k_len, q_len, num_k):
+    def q_loop(q_idx, _, *, s_idx, q_start, q_end, k_len, q_len, num_k,
+               global_cache_len):
         target_lane = 0
         min_len = lane_lengths_ref[0]
         for b in range(1, cfgs.batch_size):
@@ -312,6 +398,7 @@ def compute_metadata(
             k_len=k_len,
             q_len=q_len,
             end_k_idx=end_k_idx,
+            global_cache_len=global_cache_len,
         )
         lane_lengths_ref[target_lane] = jax.lax.fori_loop(
             start_k_idx, end_k_idx, k_loop_fn, curr_ptr)
@@ -320,8 +407,20 @@ def compute_metadata(
     def seq_loop(s_idx, _):
         q_start = cu_q_lens_ref[s_idx]
         q_end = cu_q_lens_ref[s_idx + 1]
-        k_len = kv_lens_ref[s_idx]
+        k_len_global = kv_lens_ref[s_idx]
         q_len = q_end - q_start
+
+        global_cache_len = k_len_global - q_len
+
+        # Convert to LOCAL kv_len for CP: cache is sharded (1/G per rank),
+        # but new KV is NOT sharded (all ranks hold all q_len new tokens).
+        if cfgs.serve.cp_group_size is not None and cp_rank_ref is not None:
+            G = cfgs.serve.cp_group_size
+            rank = cp_rank_ref[0]
+            local_cache_len = (global_cache_len + G - 1 - rank) // G
+            k_len = local_cache_len + q_len
+        else:
+            k_len = k_len_global
 
         num_q = pl.cdiv(q_len, cfgs.bq_sz)
         num_k = pl.cdiv(k_len, cfgs.bkv_sz)
@@ -334,6 +433,7 @@ def compute_metadata(
             k_len=k_len,
             q_len=q_len,
             num_k=num_k,
+            global_cache_len=global_cache_len,
         )
 
         jax.lax.fori_loop(0, num_q, q_loop_fn, None)
@@ -347,6 +447,7 @@ def rpa_metadata_schedule_kernel(
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
     distribution_ref: jax.Ref,
+    cp_rank_ref: jax.Array | None,
     # Outputs.
     schedule_hbm_ref: RpaSchedule,
     # Scratch.
@@ -398,6 +499,7 @@ def rpa_metadata_schedule_kernel(
         lane_lengths_ref,
         cfgs=cfgs,
         update_kv_cache=update_kv_cache,
+        cp_rank_ref=cp_rank_ref,
     )
 
     # Step 2: Compute actual number of steps.
@@ -464,10 +566,13 @@ def generate_rpa_metadata(
     distribution: jax.Array,
     cfgs: configs.RpaConfigs,
     *,
+    cp_rank: jax.Array | None = None,
     interpret=False,
     update_kv_cache: bool = True,
 ) -> RpaSchedule:
     schedule_shaped_dtype = RpaSchedule.create_shape_dtype(cfgs)
+    scalar_prefetches = (cu_q_lens, kv_lens, distribution, cp_rank)
+    num_scalar_prefetch = len(scalar_prefetches)
 
     return pl.pallas_call(
         functools.partial(rpa_metadata_schedule_kernel,
@@ -475,7 +580,7 @@ def generate_rpa_metadata(
                           update_kv_cache=update_kv_cache),
         out_shape=schedule_shaped_dtype,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=num_scalar_prefetch,
             in_specs=[],
             out_specs=schedule_shaped_dtype.out_specs(),
             scratch_shapes=[
@@ -486,4 +591,4 @@ def generate_rpa_metadata(
         ),
         interpret=interpret,
         name="rpa_metadata_schedule",
-    )(cu_q_lens, kv_lens, distribution)
+    )(*scalar_prefetches)

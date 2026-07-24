@@ -65,6 +65,10 @@ class ServingConfigs:
     scale_q: int | None = None
     scale_k: int | None = None
     scale_v: int | None = None
+    cp_group_size: int | None = None
+    skip_cache_attn: bool = False
+    skip_current_attn: bool = False
+    return_lse: bool = False
 
     @property
     def pages_per_seq(self) -> int:
@@ -240,6 +244,15 @@ class RpaConfigs:
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
         return utils.align_to(self.model.num_kv_heads * 2,
                               kv_packing) // kv_packing
+
+    @property
+    def kv_shuffle_vmem_shape(self):
+        """Shape of the CP shuffle staging buffer (n_buffer slots x batch)."""
+        if self.serve.cp_group_size is None:
+            return None
+        shuffle_bkv = pl.cdiv(self.bkv_sz, self.serve.cp_group_size)
+        return (self.n_buffer, self.batch_size, shuffle_bkv, self.kv_hbm_stride,
+                self.serve.packing_kv, self.model.head_dim)
 
     @property
     def fuse_accum(self) -> bool:

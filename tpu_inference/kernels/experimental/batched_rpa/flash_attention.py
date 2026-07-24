@@ -29,8 +29,10 @@ def flash_attention_qk_softmax(
     processed_q_len: list[jax.Array],  # [B]
     processed_kv_len: list[jax.Array],  # [B]
     effective_kv_len: list[jax.Array],  # [B]
+    kv_cache_len_local: list[jax.Array],  # [B]
     cfgs: configs.RpaConfigs,
     bq_start: int,
+    cp_rank: jax.Array | None = None,
 ):
     """Flash attention kernel."""
     b, k_heads, tq, _ = q.shape
@@ -75,11 +77,23 @@ def flash_attention_qk_softmax(
 
         eff_kv_len_b = effective_kv_len[b_idx]
         mask_b = q_idx_b < eff_kv_len_b
+        # if cfgs.serve.use_causal_mask:
+        #     # Both q_idx_b and kv_idx_b are LOCAL indices after rpa_body
+        #     # converts to local kv_len, so a direct comparison is correct.
+        #     mask_b = jnp.logical_and(mask_b, q_idx_b >= kv_idx_b)
         mask_b = jnp.logical_and(mask_b, q_idx_b >= kv_idx_b)
 
         if (sliding_window := cfgs.model.sliding_window) is not None:
             mask_b = jnp.logical_and(mask_b, q_idx_b
                                      < kv_idx_b + sliding_window)
+
+        if cfgs.serve.skip_cache_attn:
+            cache_len_b = kv_cache_len_local[b_idx].astype(int_ty)
+            mask_b = jnp.logical_and(mask_b, kv_idx_b >= cache_len_b)
+
+        if cfgs.serve.skip_current_attn:
+            cache_len_b = kv_cache_len_local[b_idx].astype(int_ty)
+            mask_b = jnp.logical_and(mask_b, kv_idx_b < cache_len_b)
 
         qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
     qk = jnp.stack(qk_masked, axis=0)

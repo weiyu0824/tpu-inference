@@ -334,8 +334,12 @@ def calculate_block_sizes(
         "out_dtype",
         "use_causal_mask",
         "update_kv_cache",
+        "cp_group_size",
+        "skip_cache_attn",
+        "skip_current_attn",
+        "return_lse",
     ),
-    donate_argnames=("queries", "keys", "values", "kv_cache"),
+    donate_argnames=("kv_cache",),
 )
 def ragged_paged_attention(
     queries: jax.Array,
@@ -362,7 +366,12 @@ def ragged_paged_attention(
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,
-) -> tuple[jax.Array, jax.Array]:
+    cp_group_size: int | None = None,
+    cp_rank: jax.Array | None = None,
+    skip_cache_attn: bool = False,
+    skip_current_attn: bool = False,
+    return_lse: bool = False,
+) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
     Args:
@@ -404,10 +413,11 @@ def ragged_paged_attention(
         new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
             kv_packing, head_dim]. Result of new kv cache where k & vs are
             concatenated along num kv heads dim.
+        lse (only when return_lse=True): [max_num_tokens, num_q_heads].
+            Log-sum-exp values (m + log(l)) for each query token and head,
+            needed for merging partial attention results in CP.
     """
 
-    if not use_causal_mask:
-        raise ValueError("Only causal attention is supported.")
     if chunk_prefill_size is not None:
         raise ValueError("Specifying chunk prefill size is not supported.")
     if debug_mode:
@@ -448,6 +458,10 @@ def ragged_paged_attention(
         scale_q=q_scale,
         scale_k=k_scale,
         scale_v=v_scale,
+        cp_group_size=cp_group_size,
+        skip_cache_attn=skip_cache_attn,
+        skip_current_attn=skip_current_attn,
+        return_lse=return_lse,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(queries, keys, values, queries.dtype,
@@ -456,10 +470,23 @@ def ragged_paged_attention(
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs, serve_cfgs, vmem_limit_bytes)
 
+    # Pre-allocate LSE buffer.
+    lse_hbm_init: jax.Array | None = None
+    if return_lse:
+        gqh = num_q_heads // num_kv_heads
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        max_tokens = queries.shape[0]
+        lse_hbm_init = jnp.full(
+            [num_kv_heads, max_tokens * gqh, num_lanes],
+            -jnp.inf,
+            dtype=out_dtype,
+        )
+
     def run_rpa_kernel(
         mode: configs.RpaCase,
         o_hbm_alias_q_hbm: jax.Array,
         kv_cache: jax.Array,
+        lse_hbm_in: jax.Array | None,
     ):
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
@@ -489,9 +516,10 @@ def ragged_paged_attention(
             kv_lens,
             distribution,
             cfgs=cfgs,
+            cp_rank=cp_rank if cp_group_size is not None else None,
             update_kv_cache=update_kv_cache,
         )
-        return kernel.rpa_kernel(
+        result = kernel.rpa_kernel(
             cu_q_lens,
             kv_lens,
             page_indices,
@@ -499,13 +527,21 @@ def ragged_paged_attention(
             o_hbm_alias_q_hbm,
             new_kv_hbm,
             kv_cache,
+            lse_hbm_in,
+            cp_rank if cp_group_size is not None else None,
             cfgs=cfgs,
         )
+        if return_lse:
+            o_out, kv_out, lse_out = result
+        else:
+            o_out, kv_out = result
+            lse_out = None
+        return o_out, kv_out, lse_out
 
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.DECODE, q_hbm,
-                                                 kv_cache)
-    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.MIXED,
-                                                 o_hbm_alias_q_hbm, kv_cache)
+    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+        configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init)
+    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
+        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm)
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
@@ -516,4 +552,16 @@ def ragged_paged_attention(
     o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
 
-    return o_hbm, kv_cache
+    if not return_lse:
+        return o_hbm, kv_cache
+
+    # Reshape LSE from [num_kv_heads, max_tokens * gqh, num_lanes] to
+    # [max_tokens, num_q_heads].
+    gqh = num_q_heads_per_kv_head
+    max_tokens = queries.shape[0]
+    # Extract first lane (scalar LSE value per token-head pair).
+    lse = lse_hbm[:, :max_tokens * gqh, 0]  # [num_kv_heads, max_tokens * gqh]
+    lse = lse.reshape(num_kv_heads, max_tokens, gqh)  # [num_kv_heads, max_tokens, gqh]
+    lse = lse.transpose(1, 0, 2).reshape(max_tokens, num_q_heads)  # [max_tokens, num_q_heads]
+
+    return o_hbm, kv_cache, lse
