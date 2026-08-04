@@ -203,11 +203,15 @@ def rpa_body(
         q_len = q_end - q_start
         global_cache_len = kv_len - q_len
 
-        # Convert to local lengths for CP: KV cache is sharded (1/cp_group_size per rank)
-        # but new KV is NOT sharded (all ranks hold all q_len new tokens).
-        if cp_group_size is not None:
+        # For CACHE_ONLY CP, shrink kv_len to the tokens this rank owns so that
+        # masking and block iteration stay in the local coordinate frame.
+        # For all other scopes the scheduler uses global k_len, so masking must
+        # also use global coordinates (same as the non-CP path).
+        if (cp_group_size is not None and
+                cfgs.serve.attention_scope == configs.AttentionScope.CACHE_ONLY):
             local_cache_len = utils.cp_local_cache_len(global_cache_len,
-                                                       cp_group_size, cp_rank)
+                                                       cp_group_size, cp_rank,
+                                                       cfgs.serve.page_size)
             local_kv_len = local_cache_len + q_len
             offset = local_cache_len
         else:
@@ -583,15 +587,11 @@ def rpa_kernel(
                 pltpu.SemaphoreType.DMA(
                     (1, )) if return_lse else None,  # lse_sem
             ),
-            kv_shuffle_ref=pltpu.VMEM(cfgs.kv_shuffle_vmem_shape,
-                                      dtype=cfgs.serve.dtype_kv)
-            if cfgs.kv_shuffle_vmem_shape is not None else None,
         )
         def _run(final_allocs,
                  schedule_ref,
                  dma_sem,
-                 scratches,
-                 kv_shuffle_ref=None):
+                 scratches):
 
             # Transfer schedule from HBM to SMEM --- we only copy what we need. Since
             # we almost always over-allocate schedule size, we only want to copy a
@@ -631,10 +631,8 @@ def rpa_kernel(
 
             pipeline_func(
                 (q_hbm_ref, schedule_ref),
-                (
-                    kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref,
-                    page_indices_ref, cp_rank_ref, kv_shuffle_ref
-                ),  # Pass CP-related (cp_rank and kv_shuffle_ref) to KVBufferedRef
+                (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref,
+                 page_indices_ref),
                 (o_hbm_ref, schedule_ref),
                 scratches=(schedule_ref, ) + scratches + (cp_rank_ref, ),
                 allocations=final_allocs,

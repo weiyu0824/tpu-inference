@@ -286,14 +286,6 @@ class RpaConfigs:
         return utils.align_to(self.model.num_kv_heads * 2,
                               kv_packing) // kv_packing
 
-    @property
-    def kv_shuffle_vmem_shape(self):
-        """Shape of the CP shuffle staging buffer (n_buffer slots x batch)."""
-        if self.serve.cp_group_size is None or not self.serve.update_kv_cache:
-            return None
-        shuffle_bkv = pl.cdiv(self.bkv_sz, self.serve.cp_group_size)
-        return (self.n_buffer, self.batch_size, shuffle_bkv,
-                self.kv_hbm_stride, self.serve.packing_kv, self.model.head_dim)
 
     @property
     def fuse_accum(self) -> bool:
@@ -334,7 +326,10 @@ class RpaConfigs:
     def dma_kv_new_size(self) -> int:
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return 5
-        return 4
+        else:
+            if self.serve.cp_group_size is not None:
+                return 5
+            return 4
 
     @property
     def lm_scratch_shape(self):
@@ -438,3 +433,10 @@ class RpaConfigs:
                 f"Expected {cu_q_lens.shape=} to be ({max_num_seqs + 1},).")
         if distribution.shape != (3, ):
             raise ValueError(f"Expected {distribution.shape=} to be (3,).")
+
+        # Context Parallel Support
+        if self.serve.cp_group_size is not None:
+            if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+                raise ValueError("Context Parallel does not support KVLayout.SEQ_ALONG_LANE yet.")
+            if self.serve.attention_scope == AttentionScope.FULL:
+                raise ValueError("Context Parallel does not support AttentionScope.FULL where cache is sharded but current tokens is sequential")

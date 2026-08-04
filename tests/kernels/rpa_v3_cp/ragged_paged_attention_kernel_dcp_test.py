@@ -221,7 +221,10 @@ class RaggedPagedAttentionDecodeContextParallelismTest(jtu.JaxTestCase):
         # Lower head dimension.
         num_heads = (16, 2)
         head_dim = 128
-        page_size = 32
+        global_page_size = 32
+        local_page_size = global_page_size // cp_group_size
+        page_size = global_page_size
+        cp_kv_cache_interleaved_size = local_page_size if USE_BATCHED_RPA_KERNEL else 1
         rng = np.random.default_rng(1234)
 
         def gen_random(shape, dtype):
@@ -320,28 +323,37 @@ class RaggedPagedAttentionDecodeContextParallelismTest(jtu.JaxTestCase):
             kv_cache = kv_cache.at[indices].set(prefix_kv_padded)
 
         def get_kv_cache_for_rank(rank):
-            kv_cache_rank = jnp.full(kv_cache_shape, 0.0, dtype=kv_dtype)
-            for i, prefix_kv in enumerate(prefixes_kv):
-                if prefix_kv is None:
-                    continue
-                prefix_kv_rank = prefix_kv[rank::cp_group_size]
-                prefix_len_rank = prefix_kv_rank.shape[0]
-                if prefix_len_rank == 0:
-                    continue
-                indices_start = i * pages_per_seq
-                num_prefix_pages = cdiv(prefix_len_rank, page_size)
-                indices = page_indices[indices_start:indices_start +
-                                       num_prefix_pages]
-                padded_prefix_len = num_prefix_pages * page_size
-                prefix_kv_padded = jnp.pad(
-                    prefix_kv_rank,
-                    ((0, padded_prefix_len - prefix_len_rank), (0, 0), (0, 0),
-                     (0, 0)),
-                    constant_values=0.0,
-                ).reshape(num_prefix_pages, page_size,
-                          *prefix_kv_rank.shape[1:])
-                kv_cache_rank = kv_cache_rank.at[indices].set(prefix_kv_padded)
-            return kv_cache_rank
+            if cp_kv_cache_interleaved_size == 1:
+                # Token-level interleaving (rpa_v3_cp)
+                kv_cache_rank = jnp.full(kv_cache_shape, 0.0, dtype=kv_dtype)
+                for i, prefix_kv in enumerate(prefixes_kv):
+                    if prefix_kv is None:
+                        continue
+                    prefix_len = prefix_kv.shape[0]
+                    indices_start = i * pages_per_seq
+                    num_prefix_pages = cdiv(prefix_len, page_size)
+                    indices = page_indices[indices_start:indices_start +
+                                          num_prefix_pages]
+                    prefix_kv_rank = prefix_kv[rank::cp_group_size]
+                    prefix_len_rank = prefix_kv_rank.shape[0]
+                    if prefix_len_rank == 0:
+                        continue
+                    num_rank_pages = cdiv(prefix_len_rank, page_size)
+                    padded_len = num_rank_pages * page_size
+                    prefix_kv_padded = jnp.pad(
+                        prefix_kv_rank,
+                        ((0, padded_len - prefix_len_rank), (0, 0), (0, 0),
+                         (0, 0)),
+                        constant_values=0.0,
+                    ).reshape(num_rank_pages, page_size,
+                              *prefix_kv_rank.shape[1:])
+                    kv_cache_rank = kv_cache_rank.at[
+                        indices[:num_rank_pages]].set(prefix_kv_padded)
+                return kv_cache_rank
+            else:
+                # Page-level (batched_rpa CP): compact per-rank cache.
+                lp = local_page_size
+                return kv_cache[:, rank * lp:(rank + 1) * lp, ...]
 
         kwargs = {
             "use_causal_mask": True,
@@ -387,43 +399,44 @@ class RaggedPagedAttentionDecodeContextParallelismTest(jtu.JaxTestCase):
             query_lses.append(query_lse)
             print("Verifying KV cache for rank after FIRST call...")
             for i, (q_len, kv_len) in enumerate(seq_lens):
-                num_pages_seq = cdiv(kv_len, page_size)
                 indices_start = i * pages_per_seq
-                page_indices_seq = page_indices[indices_start:indices_start +
-                                                num_pages_seq]
-                expected_kv_seq = expected_kv_cache[page_indices_seq].reshape(
-                    -1, *kv_cache.shape[-3:])[:kv_len]
-                rank_kv_seq = updated_kv_cache[page_indices_seq].reshape(
-                    -1, *kv_cache.shape[-3:])[:kv_len]
-                expected_kv_for_rank = expected_kv_seq[rank::cp_group_size]
-                num_tokens_for_rank = expected_kv_for_rank.shape[0]
-                mismatch = jnp.abs(rank_kv_seq[:num_tokens_for_rank] -
-                                   expected_kv_for_rank)
-                bad = jnp.where(mismatch > 1e-6)
-                if len(bad[0]) > 0:
-                    first_bad = bad[0][0]
-                    print(
-                        f"  FAIL rank={rank} seq={i}: {len(bad[0])} mismatches, first bad token={first_bad}"
+                if cp_kv_cache_interleaved_size == 1:
+                    num_pages_seq = cdiv(kv_len, page_size)
+                    page_indices_seq = page_indices[indices_start:indices_start +
+                                                    num_pages_seq]
+                    expected_kv_seq = expected_kv_cache[page_indices_seq].reshape(
+                        -1, *kv_cache.shape[-3:])[:kv_len]
+                    rank_kv_seq = updated_kv_cache[page_indices_seq].reshape(
+                        -1, *kv_cache.shape[-3:])[:kv_len]
+                    expected_kv_for_rank = expected_kv_seq[rank::cp_group_size]
+                    num_tokens_for_rank = expected_kv_for_rank.shape[0]
+                    self.assertAllClose(
+                        rank_kv_seq[:num_tokens_for_rank],
+                        expected_kv_for_rank,
+                        rtol=1e-6,
+                        atol=1e-6,
+                        err_msg=
+                        f"KV cache after FIRST call for rank {rank}, seq {i} does not match expected.",
                     )
-                    # Show first few bad values
-                    for t in range(max(0, first_bad - 1),
-                                   min(num_tokens_for_rank, first_bad + 3)):
-                        act = rank_kv_seq[
-                            t, 0, 0, 0]  # first head, first packing, first dim
-                        exp = expected_kv_for_rank[t, 0, 0, 0]
-                        # find what expected_kv_seq token t*cp_group_size+rank is
-                        global_tok = t * cp_group_size + rank
-                        print(
-                            f"    tok={t} (global={global_tok}): act={float(act):.4f} exp={float(exp):.4f}"
+                else:
+                    # Page-level (batched_rpa CP): compact per-rank validation.
+                    # updated_kv_cache shape: (num_pages, local_page_size, ...)
+                    # rank r's compact slot j = ref global slot j's rank-r sub-page
+                    lp = local_page_size
+                    num_sub_pages = cdiv(kv_len, lp)
+                    for sp in range(rank, num_sub_pages, cp_group_size):
+                        j = sp // cp_group_size
+                        phys = int(page_indices[indices_start + j])
+                        tok_count = min((sp + 1) * lp, kv_len) - sp * lp
+                        self.assertAllClose(
+                            updated_kv_cache[phys, :tok_count],
+                            expected_kv_cache[phys,
+                                              rank * lp:rank * lp + tok_count],
+                            rtol=1e-6,
+                            atol=1e-6,
+                            err_msg=
+                            f"KV cache after FIRST call for rank {rank}, seq {i}, sub_page {sp}.",
                         )
-                self.assertAllClose(
-                    rank_kv_seq[:num_tokens_for_rank],
-                    expected_kv_for_rank,
-                    rtol=1e-6,
-                    atol=1e-6,
-                    err_msg=
-                    f"KV cache after FIRST call for rank {rank}, seq {i} does not match expected.",
-                )
                 print(f"KV cache for rank {rank}, seq {i} passed!")
             print(f"Compute attention for context only on rank {rank}")
             context_out, final_kv_cache, context_lse = ragged_paged_attention(
@@ -449,24 +462,41 @@ class RaggedPagedAttentionDecodeContextParallelismTest(jtu.JaxTestCase):
             print(f"LSE: context={context_lse[:seq_lens[0][0]]}")
             print(f"Verifying KV cache for rank {rank}...")
             for i, (q_len, kv_len) in enumerate(seq_lens):
-                num_pages_seq = cdiv(kv_len, page_size)
                 indices_start = i * pages_per_seq
-                page_indices_seq = page_indices[indices_start:indices_start +
-                                                num_pages_seq]
-                expected_kv_seq = expected_kv_cache[page_indices_seq].reshape(
-                    -1, *kv_cache.shape[-3:])[:kv_len]
-                rank_kv_seq = final_kv_cache[page_indices_seq].reshape(
-                    -1, *kv_cache.shape[-3:])[:kv_len]
-                expected_kv_for_rank = expected_kv_seq[rank::cp_group_size]
-                num_tokens_for_rank = expected_kv_for_rank.shape[0]
-                self.assertAllClose(
-                    rank_kv_seq[:num_tokens_for_rank],
-                    expected_kv_for_rank,
-                    rtol=1e-6,
-                    atol=1e-6,
-                    err_msg=
-                    f"KV cache for rank {rank}, seq {i} does not match expected KV cache.",
-                )
+                if cp_kv_cache_interleaved_size == 1:
+                    num_pages_seq = cdiv(kv_len, page_size)
+                    page_indices_seq = page_indices[indices_start:indices_start +
+                                                    num_pages_seq]
+                    expected_kv_seq = expected_kv_cache[page_indices_seq].reshape(
+                        -1, *kv_cache.shape[-3:])[:kv_len]
+                    rank_kv_seq = final_kv_cache[page_indices_seq].reshape(
+                        -1, *kv_cache.shape[-3:])[:kv_len]
+                    expected_kv_for_rank = expected_kv_seq[rank::cp_group_size]
+                    num_tokens_for_rank = expected_kv_for_rank.shape[0]
+                    self.assertAllClose(
+                        rank_kv_seq[:num_tokens_for_rank],
+                        expected_kv_for_rank,
+                        rtol=1e-6,
+                        atol=1e-6,
+                        err_msg=
+                        f"KV cache for rank {rank}, seq {i} does not match expected KV cache.",
+                    )
+                else:
+                    lp = local_page_size
+                    num_sub_pages = cdiv(kv_len, lp)
+                    for sp in range(rank, num_sub_pages, cp_group_size):
+                        j = sp // cp_group_size
+                        phys = int(page_indices[indices_start + j])
+                        tok_count = min((sp + 1) * lp, kv_len) - sp * lp
+                        self.assertAllClose(
+                            final_kv_cache[phys, :tok_count],
+                            expected_kv_cache[phys,
+                                              rank * lp:rank * lp + tok_count],
+                            rtol=1e-6,
+                            atol=1e-6,
+                            err_msg=
+                            f"KV cache for rank {rank}, seq {i}, sub_page {sp}.",
+                        )
 
         # Merge all attention results from all ranks and phases
         print("Merging attention results across ranks and phases...")
